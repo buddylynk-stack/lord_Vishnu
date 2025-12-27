@@ -24,18 +24,23 @@ router.post('/presign', verifyToken, async (req, res) => {
         const key = `${safeFolder}/${req.userId}/${timestamp}-${safeFilename}`;
 
         // Create pre-signed URL (valid for 5 minutes)
+        // ACL: public-read allows files to be accessed via CloudFront CDN
         const command = new PutObjectCommand({
             Bucket: S3_BUCKET,
             Key: key,
-            ContentType: contentType
+            ContentType: contentType,
+            ACL: 'public-read'
         });
 
         const uploadUrl = await getSignedUrl(s3Client, command, { expiresIn: 300 });
 
-        // Return the upload URL and the final file URL
-        const fileUrl = `https://${S3_BUCKET}.s3.us-east-1.amazonaws.com/${key}`;
+        // Return the upload URL and the final CDN file URL (CloudFront for faster delivery)
+        const CLOUDFRONT_DOMAIN = 'd2cwas7x7omdpp.cloudfront.net';
+        const fileUrl = `https://${CLOUDFRONT_DOMAIN}/${key}`;
+        const s3Url = `https://${S3_BUCKET}.s3.us-east-1.amazonaws.com/${key}`;
 
-        res.json({ uploadUrl, fileUrl, key });
+        console.log(`Upload: S3=${s3Url}, CDN=${fileUrl}`);
+        res.json({ uploadUrl, fileUrl, key, s3Url });
     } catch (err) {
         console.error('Presign error:', err);
         res.status(500).json({ error: 'Failed to generate upload URL' });
