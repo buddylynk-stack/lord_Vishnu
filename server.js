@@ -17,6 +17,7 @@ const followRoutes = require('./routes/follows');
 const messageRoutes = require('./routes/messages');
 const groupRoutes = require('./routes/groups');
 const blockRoutes = require('./routes/blocks');
+const nsfwRoutes = require('./routes/nsfw');
 const { initializeSignaling } = require('./services/signaling');
 
 const app = express();
@@ -111,6 +112,7 @@ app.use('/api/follows', followRoutes);
 app.use('/api/messages', messageRoutes);
 app.use('/api/groups', groupRoutes);
 app.use('/api/blocks', blockRoutes);
+app.use('/api/nsfw', nsfwRoutes); // Admin NSFW content flagging
 
 // Deep Link routes - redirect to app or show landing page
 app.get('/post/:postId', (req, res) => {
