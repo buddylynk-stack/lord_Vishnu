@@ -208,8 +208,8 @@ router.delete('/:postId/like', verifyToken, async (req, res) => {
     }
 });
 
-// Share post - increments shares count
-router.post('/:postId/share', verifyToken, async (req, res) => {
+// Share post - increments shares count (no auth required for sharing)
+router.post('/:postId/share', async (req, res) => {
     try {
         const { postId } = req.params;
 
