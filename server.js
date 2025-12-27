@@ -6,6 +6,7 @@ const rateLimit = require('express-rate-limit');
 const http = require('http');
 const WebSocket = require('ws');
 const { Server } = require('socket.io');
+const path = require('path');
 
 const authRoutes = require('./routes/auth');
 const userRoutes = require('./routes/users');
@@ -20,6 +21,9 @@ const { initializeSignaling } = require('./services/signaling');
 
 const app = express();
 const server = http.createServer(app);
+
+// Serve assetlinks.json for Android App Links verification
+app.use('/.well-known', express.static(path.join(__dirname, '.well-known')));
 
 // Socket.io for WebRTC call signaling - SECURITY: Restrict CORS
 const allowedOrigins = process.env.ALLOWED_ORIGINS ? process.env.ALLOWED_ORIGINS.split(',') : [];
