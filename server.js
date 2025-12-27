@@ -112,6 +112,81 @@ app.use('/api/messages', messageRoutes);
 app.use('/api/groups', groupRoutes);
 app.use('/api/blocks', blockRoutes);
 
+// Deep Link routes - redirect to app or show landing page
+app.get('/post/:postId', (req, res) => {
+    const postId = req.params.postId;
+    const userAgent = req.headers['user-agent'] || '';
+    const isAndroid = userAgent.toLowerCase().includes('android');
+
+    if (isAndroid) {
+        // Try to open app with intent fallback
+        const intentUrl = `intent://post/${postId}#Intent;scheme=buddylynk;package=com.orignal.buddylynk;S.browser_fallback_url=https://play.google.com/store/apps/details?id=com.orignal.buddylynk;end`;
+        res.redirect(intentUrl);
+    } else {
+        // Show landing page for other devices
+        res.send(`
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <meta charset="utf-8">
+                <meta name="viewport" content="width=device-width, initial-scale=1">
+                <title>BuddyLynk - View Post</title>
+                <style>
+                    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); min-height: 100vh; display: flex; align-items: center; justify-content: center; margin: 0; color: white; }
+                    .container { text-align: center; padding: 40px; }
+                    h1 { font-size: 2.5rem; margin-bottom: 20px; background: linear-gradient(90deg, #8B5CF6, #EC4899); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+                    p { color: #a0aec0; margin-bottom: 30px; }
+                    .btn { display: inline-block; padding: 15px 40px; background: linear-gradient(90deg, #8B5CF6, #EC4899); color: white; text-decoration: none; border-radius: 30px; font-weight: bold; }
+                </style>
+            </head>
+            <body>
+                <div class="container">
+                    <h1>BuddyLynk</h1>
+                    <p>Download the app to view this post</p>
+                    <a class="btn" href="https://play.google.com/store/apps/details?id=com.orignal.buddylynk">Get the App</a>
+                </div>
+            </body>
+            </html>
+        `);
+    }
+});
+
+app.get('/user/:userId', (req, res) => {
+    const userId = req.params.userId;
+    const userAgent = req.headers['user-agent'] || '';
+    const isAndroid = userAgent.toLowerCase().includes('android');
+
+    if (isAndroid) {
+        const intentUrl = `intent://user/${userId}#Intent;scheme=buddylynk;package=com.orignal.buddylynk;S.browser_fallback_url=https://play.google.com/store/apps/details?id=com.orignal.buddylynk;end`;
+        res.redirect(intentUrl);
+    } else {
+        res.send(`
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <meta charset="utf-8">
+                <meta name="viewport" content="width=device-width, initial-scale=1">
+                <title>BuddyLynk - View Profile</title>
+                <style>
+                    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); min-height: 100vh; display: flex; align-items: center; justify-content: center; margin: 0; color: white; }
+                    .container { text-align: center; padding: 40px; }
+                    h1 { font-size: 2.5rem; margin-bottom: 20px; background: linear-gradient(90deg, #8B5CF6, #EC4899); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+                    p { color: #a0aec0; margin-bottom: 30px; }
+                    .btn { display: inline-block; padding: 15px 40px; background: linear-gradient(90deg, #8B5CF6, #EC4899); color: white; text-decoration: none; border-radius: 30px; font-weight: bold; }
+                </style>
+            </head>
+            <body>
+                <div class="container">
+                    <h1>BuddyLynk</h1>
+                    <p>Download the app to view this profile</p>
+                    <a class="btn" href="https://play.google.com/store/apps/details?id=com.orignal.buddylynk">Get the App</a>
+                </div>
+            </body>
+            </html>
+        `);
+    }
+});
+
 app.get('/health', (req, res) => res.json({ status: 'ok' }));
 
 const PORT = process.env.PORT || 3000;
