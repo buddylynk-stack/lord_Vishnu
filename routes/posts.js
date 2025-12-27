@@ -142,17 +142,23 @@ router.get('/:postId', async (req, res) => {
     }
 });
 
-// Like post
+// Like post - adds user to likedBy array and increments likes count
 router.post('/:postId/like', verifyToken, async (req, res) => {
     try {
         const { postId } = req.params;
+        const userId = req.userId;
 
-        // Increment like count
+        // Add user to likedBy and increment likes count
         await docClient.send(new UpdateCommand({
             TableName: Tables.POSTS,
             Key: { postId },
-            UpdateExpression: 'SET likeCount = if_not_exists(likeCount, :zero) + :inc',
-            ExpressionAttributeValues: { ':inc': 1, ':zero': 0 }
+            UpdateExpression: 'SET likes = if_not_exists(likes, :zero) + :inc, likedBy = list_append(if_not_exists(likedBy, :empty), :user)',
+            ExpressionAttributeValues: {
+                ':inc': 1,
+                ':zero': 0,
+                ':empty': [],
+                ':user': [userId]
+            }
         }));
 
         res.json({ success: true });
@@ -162,17 +168,36 @@ router.post('/:postId/like', verifyToken, async (req, res) => {
     }
 });
 
-// Unlike post
+// Unlike post - removes user from likedBy and decrements likes count
 router.delete('/:postId/like', verifyToken, async (req, res) => {
     try {
         const { postId } = req.params;
+        const userId = req.userId;
 
+        // First get the post to find user index in likedBy
+        const getResult = await docClient.send(new GetCommand({
+            TableName: Tables.POSTS,
+            Key: { postId }
+        }));
+
+        if (!getResult.Item) {
+            return res.status(404).json({ error: 'Post not found' });
+        }
+
+        const likedBy = getResult.Item.likedBy || [];
+        const userIndex = likedBy.indexOf(userId);
+
+        if (userIndex === -1) {
+            return res.json({ success: true }); // User hasn't liked this post
+        }
+
+        // Remove user from likedBy and decrement likes
         await docClient.send(new UpdateCommand({
             TableName: Tables.POSTS,
             Key: { postId },
-            UpdateExpression: 'SET likeCount = likeCount - :dec',
+            UpdateExpression: 'SET likes = likes - :dec REMOVE likedBy[' + userIndex + ']',
             ExpressionAttributeValues: { ':dec': 1 },
-            ConditionExpression: 'likeCount > :zero',
+            ConditionExpression: 'likes > :zero',
             ExpressionAttributeValues: { ':dec': 1, ':zero': 0 }
         }));
 
@@ -180,6 +205,79 @@ router.delete('/:postId/like', verifyToken, async (req, res) => {
     } catch (err) {
         console.error('Unlike error:', err);
         res.status(500).json({ error: 'Failed to unlike post' });
+    }
+});
+
+// Share post - increments shares count
+router.post('/:postId/share', verifyToken, async (req, res) => {
+    try {
+        const { postId } = req.params;
+
+        await docClient.send(new UpdateCommand({
+            TableName: Tables.POSTS,
+            Key: { postId },
+            UpdateExpression: 'SET shares = if_not_exists(shares, :zero) + :inc',
+            ExpressionAttributeValues: { ':inc': 1, ':zero': 0 }
+        }));
+
+        res.json({ success: true });
+    } catch (err) {
+        console.error('Share error:', err);
+        res.status(500).json({ error: 'Failed to share post' });
+    }
+});
+
+// Add comment to post
+router.post('/:postId/comment', verifyToken, async (req, res) => {
+    try {
+        const { postId } = req.params;
+        const { text } = req.body;
+        const userId = req.userId;
+
+        if (!text || text.trim().length === 0) {
+            return res.status(400).json({ error: 'Comment text is required' });
+        }
+
+        const comment = {
+            commentId: uuidv4(),
+            userId,
+            text: text.trim(),
+            createdAt: new Date().toISOString()
+        };
+
+        await docClient.send(new UpdateCommand({
+            TableName: Tables.POSTS,
+            Key: { postId },
+            UpdateExpression: 'SET comments = list_append(if_not_exists(comments, :empty), :comment)',
+            ExpressionAttributeValues: {
+                ':empty': [],
+                ':comment': [comment]
+            }
+        }));
+
+        res.json({ success: true, comment });
+    } catch (err) {
+        console.error('Comment error:', err);
+        res.status(500).json({ error: 'Failed to add comment' });
+    }
+});
+
+// Get comments for post
+router.get('/:postId/comments', async (req, res) => {
+    try {
+        const { postId } = req.params;
+
+        const result = await docClient.send(new GetCommand({
+            TableName: Tables.POSTS,
+            Key: { postId },
+            ProjectionExpression: 'comments'
+        }));
+
+        const comments = result.Item?.comments || [];
+        res.json(comments);
+    } catch (err) {
+        console.error('Get comments error:', err);
+        res.status(500).json({ error: 'Failed to get comments' });
     }
 });
 
