@@ -156,20 +156,7 @@ router.post('/flag', verifyToken, async (req, res) => {
 
         await docClient.send(command);
 
-        // Also sync to Posts table
-        try {
-            const updateCommand = new UpdateCommand({
-                TableName: POSTS_TABLE,
-                Key: { postId },
-                UpdateExpression: 'SET isNsfw = :nsfw',
-                ExpressionAttributeValues: {
-                    ':nsfw': adultFlag
-                }
-            });
-            await docClient.send(updateCommand);
-        } catch (e) {
-            console.log('Posts table sync skipped:', e.message);
-        }
+        // Note: No sync to Posts table needed - feed endpoint queries NSFW table directly
 
         console.log(`Post ${postId} by ${username} flagged as ${adultFlag ? 'ADULT' : 'SAFE'} by admin ${adminUserId}`);
 

@@ -47,15 +47,9 @@ function convertPostMediaUrls(post) {
         post.mediaUrls = post.mediaUrls.map(url => toCloudFrontUrl(url));
     }
 
-    // Normalize NSFW field - ensure consistent naming for Android app
-    // isNsfw (from DynamoDB) -> isNSFW (for app) and isSensitive (alias)
-    if (post.isNsfw !== undefined) {
-        post.isNSFW = post.isNsfw === true;
-        post.isSensitive = post.isNsfw === true;
-    } else {
-        post.isNSFW = false;
-        post.isSensitive = false;
-    }
+    // Set default NSFW flags (will be overridden by NSFW table lookup in feed endpoint)
+    if (post.isNSFW === undefined) post.isNSFW = false;
+    if (post.isSensitive === undefined) post.isSensitive = false;
 
     return post;
 }
