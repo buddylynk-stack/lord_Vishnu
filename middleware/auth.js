@@ -17,7 +17,10 @@ function generateToken(userId) {
 
 function verifyToken(req, res, next) {
     const authHeader = req.headers.authorization;
+    console.log(`[Auth] verifyToken for ${req.path}: header=${authHeader ? 'present' : 'missing'}`);
+
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
+        console.log(`[Auth] No token provided for ${req.path}`);
         return res.status(401).json({ error: 'No token provided' });
     }
 
@@ -25,8 +28,10 @@ function verifyToken(req, res, next) {
     try {
         const decoded = jwt.verify(token, JWT_SECRET);
         req.userId = decoded.userId;
+        console.log(`[Auth] Token verified for ${req.path}, userId: ${req.userId}`);
         next();
     } catch (err) {
+        console.log(`[Auth] Invalid token for ${req.path}: ${err.message}`);
         return res.status(401).json({ error: 'Invalid token' });
     }
 }
