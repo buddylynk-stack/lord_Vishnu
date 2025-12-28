@@ -117,11 +117,23 @@ router.get('/feed', async (req, res) => {
             algorithmRecommendations = await fetchRecommendations(userId, 50);
         }
 
-        // Get ALL posts from database (no limit - unlimited posts)
-        const postsResult = await docClient.send(new ScanCommand({
-            TableName: Tables.POSTS
-            // No Limit - fetch ALL posts for unlimited feed
-        }));
+        // Get ALL posts from database using pagination (DynamoDB returns max 1MB per scan)
+        let allPosts = [];
+        let lastEvaluatedKey = undefined;
+        do {
+            const scanParams = {
+                TableName: Tables.POSTS,
+            };
+            if (lastEvaluatedKey) {
+                scanParams.ExclusiveStartKey = lastEvaluatedKey;
+            }
+            const postsResult = await docClient.send(new ScanCommand(scanParams));
+            allPosts = allPosts.concat(postsResult.Items || []);
+            lastEvaluatedKey = postsResult.LastEvaluatedKey;
+            console.log(`[Feed] Fetched ${postsResult.Items?.length || 0} posts (total: ${allPosts.length})`);
+        } while (lastEvaluatedKey);
+
+        console.log(`[Feed] Total posts fetched: ${allPosts.length}`);
 
         // CRITICAL: Also fetch NSFW post IDs from NSFW table
         let nsfwPostIds = new Set();
@@ -138,7 +150,7 @@ router.get('/feed', async (req, res) => {
             console.error('[Feed] NSFW table query failed:', nsfwErr.message);
         }
 
-        let posts = (postsResult.Items || []);
+        let posts = allPosts;
 
         // Convert all media URLs to CloudFront and apply NSFW flags
         posts = posts.map(post => {
