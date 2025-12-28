@@ -1,0 +1,26 @@
+{
+    "postId": {
+        "S": "94e9da68-ad0e-4d44-8ca6-502369c6b673"
+    },
+    "userId": {
+        "S": "test-user"
+    },
+    "username": {
+        "S": "testuser"
+    },
+    "isAdult": {
+        "BOOL": true
+    },
+    "flaggedBy": {
+        "S": "admin"
+    },
+    "flaggedAt": {
+        "S": "2025-12-27T19:31:00Z"
+    },
+    "reviewedAt": {
+        "S": "2025-12-27T19:31:00Z"
+    },
+    "reason": {
+        "S": "Testing NSFW feature"
+    }
+}
