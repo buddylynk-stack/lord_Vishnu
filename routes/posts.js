@@ -117,10 +117,10 @@ router.get('/feed', async (req, res) => {
             algorithmRecommendations = await fetchRecommendations(userId, 50);
         }
 
-        // Get ALL posts from database
+        // Get ALL posts from database (no limit - unlimited posts)
         const postsResult = await docClient.send(new ScanCommand({
-            TableName: Tables.POSTS,
-            Limit: 100 // Get more posts for better variety
+            TableName: Tables.POSTS
+            // No Limit - fetch ALL posts for unlimited feed
         }));
 
         // CRITICAL: Also fetch NSFW post IDs from NSFW table
@@ -202,8 +202,8 @@ router.get('/feed', async (req, res) => {
             }
         }
 
-        // Limit final output
-        sortedPosts = sortedPosts.slice(0, 50);
+        // NO LIMIT - return all posts for unlimited feed
+        // sortedPosts = sortedPosts.slice(0, 50); // REMOVED
 
         // Cache the result (short TTL for freshness)
         feedCache = sortedPosts;
