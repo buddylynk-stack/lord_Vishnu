@@ -48,6 +48,7 @@ router.post('/track', async (req, res) => {
         const {
             userId,
             contentId,
+            contentOwnerId,  // Who created the content (to filter out own posts)
             actionType,  // 'view', 'like', 'share', 'comment', 'save', 'skip'
             watchTime,   // For video content (seconds)
             metadata     // Additional info (comment text length, share platform, etc.)
@@ -72,6 +73,7 @@ router.post('/track', async (req, res) => {
             userId: { S: userId },
             timestamp: { N: now.toString() },
             contentId: { S: contentId },
+            contentOwnerId: { S: contentOwnerId || '' },  // Store content creator ID
             actionType: { N: actionNum.toString() },
             actionWeight: { N: (ACTION_WEIGHTS[actionNum] || 1.0).toString() },
             hour: { N: date.getHours().toString() },

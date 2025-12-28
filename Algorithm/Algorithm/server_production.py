@@ -74,8 +74,12 @@ async def health_check():
 
 
 @app.get("/api/recommendations/{user_id}")
-async def get_recommendations(user_id: str, limit: int = 20):
-    """Get personalized content recommendations for a user"""
+async def get_recommendations(user_id: str, limit: int = 20, exclude_own: bool = True):
+    """
+    Get personalized content recommendations for a user.
+    EXCLUDES the user's own posts - only shows content from OTHER users.
+    Finds similar users based on engagement patterns and recommends their content.
+    """
     try:
         # 1. Get user behavior history (last 30 days)
         cutoff = int((datetime.now() - timedelta(days=30)).timestamp() * 1000)
@@ -91,18 +95,27 @@ async def get_recommendations(user_id: str, limit: int = 20):
         # 2. Analyze user preferences from behavior
         content_scores = {}
         action_counts = {i: 0 for i in range(8)}
+        user_own_content = set()  # Content created by this user (to exclude)
+        already_seen = set()  # Content already viewed (to avoid repeats)
         
         for item in user_history:
             content_id = item.get('contentId')
             action_type = int(item.get('actionType', 0))
             weight = ACTION_WEIGHTS.get(action_type, 1.0)
+            content_owner = item.get('contentOwnerId', '')
             
             action_counts[action_type] = action_counts.get(action_type, 0) + 1
+            already_seen.add(content_id)
             
-            # Build affinity scores for content
-            if content_id not in content_scores:
-                content_scores[content_id] = 0
-            content_scores[content_id] += weight
+            # Track user's own content to EXCLUDE
+            if content_owner == user_id:
+                user_own_content.add(content_id)
+            
+            # Build affinity scores for OTHER users' content only
+            if content_owner != user_id and content_id not in user_own_content:
+                if content_id not in content_scores:
+                    content_scores[content_id] = 0
+                content_scores[content_id] += weight
         
         # 3. Calculate user engagement profile
         total_actions = sum(action_counts.values()) or 1
@@ -111,51 +124,81 @@ async def get_recommendations(user_id: str, limit: int = 20):
             for i in range(8)
         ) / total_actions
         
-        # 4. Get recently engaged content as positive signals
+        # 4. Get liked content patterns (from OTHER users)
         liked_content = [
             cid for cid, score in content_scores.items() 
-            if score > 2.0  # High positive engagement
+            if score > 2.0 and cid not in user_own_content
         ]
         
-        # 5. Build recommendation list
-        # For now, use engagement scoring + randomization
-        # TODO: Integrate neural network model
+        # 5. Find similar users based on engagement patterns
+        similar_users = set()
+        for cid in liked_content[:10]:  # Top 10 liked content
+            # Find other users who liked the same content
+            try:
+                content_engagers = behavior_table.query(
+                    IndexName='contentId-timestamp-index',
+                    KeyConditionExpression=Key('contentId').eq(cid),
+                    Limit=20
+                )
+                for engager in content_engagers.get('Items', []):
+                    engager_id = engager.get('userId')
+                    if engager_id != user_id:  # Not the current user
+                        similar_users.add(engager_id)
+            except:
+                pass
         
-        recommendations = []
+        # 6. Get content from similar users (EXCLUDING current user's content)
+        recommended_from_similar = []
+        for similar_user in list(similar_users)[:5]:  # Top 5 similar users
+            try:
+                similar_behavior = behavior_table.query(
+                    KeyConditionExpression=Key('userId').eq(similar_user) & Key('timestamp').gt(cutoff),
+                    Limit=20
+                )
+                for item in similar_behavior.get('Items', []):
+                    cid = item.get('contentId')
+                    owner = item.get('contentOwnerId', '')
+                    action = int(item.get('actionType', 0))
+                    
+                    # EXCLUDE: user's own content, already seen, and low engagement
+                    if (owner != user_id and 
+                        cid not in user_own_content and 
+                        cid not in already_seen and
+                        action in [1, 2, 3, 4]):  # Only positive actions
+                        recommended_from_similar.append({
+                            "contentId": cid,
+                            "score": round(ACTION_WEIGHTS.get(action, 1.0) / 5.0, 3),
+                            "reason": "similar_users_liked",
+                            "similarUser": similar_user[:4] + "..."  # Partial for privacy
+                        })
+            except:
+                pass
         
-        # Mix strategy:
-        # 60% - Similar to liked content (exploit)
-        # 30% - Trending/popular content
-        # 10% - Random exploration
-        
-        # Mark viewed content to avoid repeats
-        viewed_content = set(content_scores.keys())
-        
-        # Return recommendations with scores
-        recommendation_list = [
-            {
-                "contentId": f"rec_{i}",  # Placeholder - integrate with actual content
-                "score": round(random.uniform(0.5, 1.0), 3),
-                "reason": random.choice([
-                    "based_on_likes", 
-                    "trending", 
-                    "similar_users", 
-                    "discover"
-                ])
-            }
-            for i in range(min(limit, 20))
-        ]
+        # 7. Deduplicate and sort recommendations
+        seen_content = set()
+        final_recommendations = []
+        for rec in sorted(recommended_from_similar, key=lambda x: x['score'], reverse=True):
+            cid = rec['contentId']
+            if cid not in seen_content and cid not in user_own_content:
+                seen_content.add(cid)
+                final_recommendations.append(rec)
+                if len(final_recommendations) >= limit:
+                    break
         
         return {
             "userId": user_id,
-            "recommendations": recommendation_list,
+            "recommendations": final_recommendations,
+            "filters": {
+                "excludedOwnContent": len(user_own_content),
+                "excludedAlreadySeen": len(already_seen),
+                "similarUsersFound": len(similar_users)
+            },
             "userProfile": {
                 "engagementScore": round(engagement_score, 2),
                 "totalActions": total_actions,
-                "likedContent": len(liked_content),
-                "viewedContent": len(viewed_content)
+                "likedContent": len(liked_content)
             },
-            "algorithm": "mindflow-v1",
+            "algorithm": "mindflow-v1.1-exclude-own",
             "timestamp": datetime.now().isoformat()
         }
         
