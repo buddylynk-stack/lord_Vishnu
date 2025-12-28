@@ -77,17 +77,41 @@ router.get('/feed', async (req, res) => {
         }
 
         // Get posts (limited for performance)
-        const result = await docClient.send(new ScanCommand({
+        const postsResult = await docClient.send(new ScanCommand({
             TableName: Tables.POSTS,
             Limit: 50
         }));
 
-        let posts = (result.Items || []).sort((a, b) =>
+        // CRITICAL: Also fetch NSFW post IDs from NSFW table
+        let nsfwPostIds = new Set();
+        try {
+            const nsfwResult = await docClient.send(new ScanCommand({
+                TableName: 'Buddylynk_NSFW',
+                FilterExpression: 'isAdult = :adult',
+                ExpressionAttributeValues: { ':adult': true },
+                ProjectionExpression: 'postId'
+            }));
+            nsfwPostIds = new Set((nsfwResult.Items || []).map(item => item.postId));
+            console.log(`[Feed] Found ${nsfwPostIds.size} NSFW posts to flag`);
+        } catch (nsfwErr) {
+            console.error('[Feed] NSFW table query failed:', nsfwErr.message);
+        }
+
+        let posts = (postsResult.Items || []).sort((a, b) =>
             new Date(b.createdAt) - new Date(a.createdAt)
         );
 
-        // Convert all media URLs to CloudFront
-        posts = posts.map(convertPostMediaUrls);
+        // Convert all media URLs to CloudFront and apply NSFW flags
+        posts = posts.map(post => {
+            const converted = convertPostMediaUrls(post);
+            // Override isNSFW if found in NSFW table (more reliable than Posts table sync)
+            if (nsfwPostIds.has(converted.postId)) {
+                converted.isNSFW = true;
+                converted.isSensitive = true;
+                console.log(`[Feed] Flagged post ${converted.postId.substring(0, 8)} as NSFW`);
+            }
+            return converted;
+        });
 
         // Cache the result
         feedCache = posts;
