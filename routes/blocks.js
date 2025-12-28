@@ -9,6 +9,8 @@ const router = express.Router();
 // Get blocked users list - uses Scan since blockId is the partition key
 router.get('/', verifyToken, async (req, res) => {
     try {
+        console.log(`[Blocks API] Getting blocks for userId: ${req.userId}`);
+
         // Scan for all blocks where blockerId matches current user
         const result = await docClient.send(new ScanCommand({
             TableName: Tables.BLOCKS || 'Buddylynk_Blocks',
@@ -16,11 +18,14 @@ router.get('/', verifyToken, async (req, res) => {
             ExpressionAttributeValues: { ':uid': req.userId }
         }));
 
+        console.log(`[Blocks API] Scan returned ${result.Items?.length || 0} items`);
+        console.log(`[Blocks API] Raw items: ${JSON.stringify(result.Items?.slice(0, 3) || [])}`);
+
         const blockedIds = (result.Items || []).map(item => item.blockedId);
-        console.log(`Get blocks for ${req.userId}: found ${blockedIds.length} blocked users`);
+        console.log(`[Blocks API] Get blocks for ${req.userId}: found ${blockedIds.length} blocked users: ${blockedIds.slice(0, 5).join(', ')}...`);
         res.json(blockedIds);
     } catch (err) {
-        console.error('Get blocked users error:', err);
+        console.error('[Blocks API] Get blocked users error:', err);
         res.status(500).json({ error: 'Failed to get blocked users' });
     }
 });
