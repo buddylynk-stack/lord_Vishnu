@@ -3,6 +3,7 @@ const { v4: uuidv4 } = require('uuid');
 const { PutCommand, GetCommand, QueryCommand, ScanCommand, DeleteCommand, UpdateCommand } = require('@aws-sdk/lib-dynamodb');
 const { docClient, Tables } = require('../config/aws');
 const { verifyToken } = require('../middleware/auth');
+const { clearFeedCache } = require('./posts'); // Import for real-time NSFW updates
 
 const router = express.Router();
 
@@ -156,7 +157,9 @@ router.post('/flag', verifyToken, async (req, res) => {
 
         await docClient.send(command);
 
-        // Note: No sync to Posts table needed - feed endpoint queries NSFW table directly
+        // CRITICAL: Clear feed cache for real-time NSFW updates
+        // This ensures the app sees the NSFW flag change immediately
+        clearFeedCache();
 
         console.log(`Post ${postId} by ${username} flagged as ${adultFlag ? 'ADULT' : 'SAFE'} by admin ${adminUserId}`);
 
@@ -196,6 +199,9 @@ router.delete('/remove/:postId', verifyToken, async (req, res) => {
         });
 
         await docClient.send(command);
+
+        // Clear feed cache for real-time updates
+        clearFeedCache();
 
         res.json({
             success: true,

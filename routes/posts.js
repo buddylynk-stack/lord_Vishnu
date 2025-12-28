@@ -57,7 +57,14 @@ function convertPostMediaUrls(post) {
 // Simple in-memory cache for feed
 let feedCache = null;
 let feedCacheTime = 0;
-const CACHE_TTL = 30000; // 30 seconds
+const CACHE_TTL = 10000; // 10 seconds - reduced for faster NSFW updates
+
+// Function to clear feed cache (called when NSFW flags change for real-time updates)
+function clearFeedCache() {
+    feedCache = null;
+    feedCacheTime = 0;
+    console.log('[Feed] Cache cleared for real-time NSFW update');
+}
 
 // Get feed posts (PUBLIC - no auth required for browsing)
 router.get('/feed', async (req, res) => {
@@ -413,4 +420,5 @@ router.get('/saved/list', verifyToken, async (req, res) => {
 });
 
 module.exports = router;
+module.exports.clearFeedCache = clearFeedCache;
 
