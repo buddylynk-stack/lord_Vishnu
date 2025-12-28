@@ -192,7 +192,8 @@ router.get('/feed', async (req, res) => {
             sortedPosts = [];
             const userIds = Object.keys(postsByUser);
             let round = 0;
-            while (sortedPosts.length < posts.length && round < 10) {
+            // NO LIMIT on rounds - include ALL posts
+            while (sortedPosts.length < posts.length && round < 1000) {
                 for (const uid of userIds) {
                     if (postsByUser[uid][round]) {
                         sortedPosts.push(postsByUser[uid][round]);
