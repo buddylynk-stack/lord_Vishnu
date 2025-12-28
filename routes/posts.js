@@ -57,30 +57,70 @@ function convertPostMediaUrls(post) {
 // Simple in-memory cache for feed
 let feedCache = null;
 let feedCacheTime = 0;
-const CACHE_TTL = 10000; // 10 seconds - reduced for faster NSFW updates
+const CACHE_TTL = 5000; // 5 seconds - short TTL for fresh content
 
-// Function to clear feed cache (called when NSFW flags change for real-time updates)
+// Function to clear feed cache (called when NSFW flags change)
 function clearFeedCache() {
     feedCache = null;
     feedCacheTime = 0;
-    console.log('[Feed] Cache cleared for real-time NSFW update');
+    console.log('[Feed] Cache cleared');
+}
+
+// Algorithm server URL for personalized recommendations
+const ALGORITHM_SERVER = 'http://54.235.126.186:8000';
+const http = require('http');
+
+// Helper to fetch recommendations from algorithm server
+async function fetchRecommendations(userId, limit = 20) {
+    return new Promise((resolve) => {
+        const url = `${ALGORITHM_SERVER}/api/recommendations/${userId}?limit=${limit}`;
+
+        const timeoutMs = 3000; // 3 second timeout
+        const req = http.get(url, { timeout: timeoutMs }, (res) => {
+            let data = '';
+            res.on('data', chunk => data += chunk);
+            res.on('end', () => {
+                try {
+                    const result = JSON.parse(data);
+                    resolve(result);
+                } catch (e) {
+                    console.log('[Feed] Algorithm parse error:', e.message);
+                    resolve(null);
+                }
+            });
+        });
+
+        req.on('error', (e) => {
+            console.log('[Feed] Algorithm server error:', e.message);
+            resolve(null);
+        });
+
+        req.on('timeout', () => {
+            console.log('[Feed] Algorithm server timeout');
+            req.destroy();
+            resolve(null);
+        });
+    });
 }
 
 // Get feed posts (PUBLIC - no auth required for browsing)
+// Uses algorithm for logged-in users, chronological for guests
 router.get('/feed', async (req, res) => {
     try {
         const now = Date.now();
+        const userId = req.headers['x-user-id'] || req.query.userId;
 
-        // Return cached response if valid
-        if (feedCache && (now - feedCacheTime) < CACHE_TTL) {
-            console.log('Serving cached feed');
-            return res.json(feedCache);
+        // Try algorithm-based recommendations for logged-in users
+        let algorithmRecommendations = null;
+        if (userId) {
+            console.log(`[Feed] Fetching recommendations for user: ${userId.substring(0, 8)}...`);
+            algorithmRecommendations = await fetchRecommendations(userId, 50);
         }
 
-        // Get posts (limited for performance)
+        // Get ALL posts from database
         const postsResult = await docClient.send(new ScanCommand({
             TableName: Tables.POSTS,
-            Limit: 50
+            Limit: 100 // Get more posts for better variety
         }));
 
         // CRITICAL: Also fetch NSFW post IDs from NSFW table
@@ -98,27 +138,78 @@ router.get('/feed', async (req, res) => {
             console.error('[Feed] NSFW table query failed:', nsfwErr.message);
         }
 
-        let posts = (postsResult.Items || []).sort((a, b) =>
-            new Date(b.createdAt) - new Date(a.createdAt)
-        );
+        let posts = (postsResult.Items || []);
 
         // Convert all media URLs to CloudFront and apply NSFW flags
         posts = posts.map(post => {
             const converted = convertPostMediaUrls(post);
-            // Override isNSFW if found in NSFW table (more reliable than Posts table sync)
+            // Override isNSFW if found in NSFW table
             if (nsfwPostIds.has(converted.postId)) {
                 converted.isNSFW = true;
                 converted.isSensitive = true;
-                console.log(`[Feed] Flagged post ${converted.postId.substring(0, 8)} as NSFW`);
             }
             return converted;
         });
 
-        // Cache the result
-        feedCache = posts;
+        // Build a map for quick lookups
+        const postMap = new Map(posts.map(p => [p.postId, p]));
+
+        // Sort posts based on algorithm recommendations OR chronological
+        let sortedPosts;
+        if (algorithmRecommendations && algorithmRecommendations.recommendations && algorithmRecommendations.recommendations.length > 0) {
+            // Use algorithm recommendations order
+            console.log(`[Feed] Using ${algorithmRecommendations.recommendations.length} algorithm recommendations`);
+
+            const recommendedIds = new Set(algorithmRecommendations.recommendations.map(r => r.contentId));
+
+            // Put recommended posts first (in algorithm order), then rest chronologically
+            const recommendedPosts = algorithmRecommendations.recommendations
+                .map(r => postMap.get(r.contentId))
+                .filter(p => p); // Filter out any null values
+
+            const otherPosts = posts
+                .filter(p => !recommendedIds.has(p.postId) && p.userId !== userId) // Exclude own posts
+                .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+
+            sortedPosts = [...recommendedPosts, ...otherPosts];
+        } else {
+            // Fallback: Chronological with randomization for variety
+            console.log('[Feed] Using chronological sort with variety');
+
+            // Group by user to avoid too many posts from same user
+            const postsByUser = {};
+            posts.forEach(p => {
+                if (!postsByUser[p.userId]) postsByUser[p.userId] = [];
+                postsByUser[p.userId].push(p);
+            });
+
+            // Sort each user's posts by date
+            Object.values(postsByUser).forEach(userPosts => {
+                userPosts.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+            });
+
+            // Interleave posts from different users for variety
+            sortedPosts = [];
+            const userIds = Object.keys(postsByUser);
+            let round = 0;
+            while (sortedPosts.length < posts.length && round < 10) {
+                for (const uid of userIds) {
+                    if (postsByUser[uid][round]) {
+                        sortedPosts.push(postsByUser[uid][round]);
+                    }
+                }
+                round++;
+            }
+        }
+
+        // Limit final output
+        sortedPosts = sortedPosts.slice(0, 50);
+
+        // Cache the result (short TTL for freshness)
+        feedCache = sortedPosts;
         feedCacheTime = now;
 
-        res.json(posts);
+        res.json(sortedPosts);
     } catch (err) {
         console.error('Feed error:', err);
         res.status(500).json({ error: 'Failed to load feed' });
