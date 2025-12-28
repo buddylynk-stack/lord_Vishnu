@@ -74,11 +74,14 @@ async def health_check():
 
 
 @app.get("/api/recommendations/{user_id}")
-async def get_recommendations(user_id: str, limit: int = 20, exclude_own: bool = True):
+async def get_recommendations(user_id: str, limit: int = 20, exclude_own: bool = True, include_nsfw: bool = False):
     """
     Get personalized content recommendations for a user.
     EXCLUDES the user's own posts - only shows content from OTHER users.
     Finds similar users based on engagement patterns and recommends their content.
+    
+    Args:
+        include_nsfw: If True, will include 18+ content in recommendations (user must have enabled this)
     """
     try:
         # 1. Get user behavior history (last 30 days)
@@ -191,7 +194,8 @@ async def get_recommendations(user_id: str, limit: int = 20, exclude_own: bool =
             "filters": {
                 "excludedOwnContent": len(user_own_content),
                 "excludedAlreadySeen": len(already_seen),
-                "similarUsersFound": len(similar_users)
+                "similarUsersFound": len(similar_users),
+                "includesNSFW": include_nsfw  # 18+ content included if user enabled
             },
             "userProfile": {
                 "engagementScore": round(engagement_score, 2),

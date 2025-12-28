@@ -74,6 +74,7 @@ router.post('/track', async (req, res) => {
             timestamp: { N: now.toString() },
             contentId: { S: contentId },
             contentOwnerId: { S: contentOwnerId || '' },  // Store content creator ID
+            isNSFW: { BOOL: metadata?.isNSFW || false },  // 18+ content flag
             actionType: { N: actionNum.toString() },
             actionWeight: { N: (ACTION_WEIGHTS[actionNum] || 1.0).toString() },
             hour: { N: date.getHours().toString() },
