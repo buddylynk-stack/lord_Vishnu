@@ -202,7 +202,14 @@ router.get('/feed', async (req, res) => {
 
             // Interleave posts from different users for variety
             sortedPosts = [];
-            const userIds = Object.keys(postsByUser);
+            let userIds = Object.keys(postsByUser);
+
+            // Shuffle userIds using Fisher-Yates for variety on each request
+            for (let i = userIds.length - 1; i > 0; i--) {
+                const j = Math.floor(Math.random() * (i + 1));
+                [userIds[i], userIds[j]] = [userIds[j], userIds[i]];
+            }
+
             let round = 0;
             // NO LIMIT on rounds - include ALL posts
             while (sortedPosts.length < posts.length && round < 1000) {
@@ -212,6 +219,13 @@ router.get('/feed', async (req, res) => {
                     }
                 }
                 round++;
+            }
+
+            // Add slight randomization to break monotony - swap adjacent pairs with 30% chance
+            for (let i = 0; i < sortedPosts.length - 1; i += 2) {
+                if (Math.random() < 0.3) {
+                    [sortedPosts[i], sortedPosts[i + 1]] = [sortedPosts[i + 1], sortedPosts[i]];
+                }
             }
         }
 
