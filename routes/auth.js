@@ -110,6 +110,12 @@ router.post('/login', async (req, res) => {
 
         const user = result.Items[0];
 
+        // Check if user is blocked by admin
+        if (user.isBlocked === true) {
+            const blockedMsg = user.blockedMessage || 'Your account has been blocked by the admin. If you believe this is a mistake, please contact support.';
+            return res.status(403).json({ error: blockedMsg, blocked: true });
+        }
+
         if (!user.password) {
             return res.status(401).json({ error: 'This account uses Google Sign-In. Please login with Google.' });
         }
@@ -154,6 +160,12 @@ router.post('/google', async (req, res) => {
         if (result.Items && result.Items.length > 0) {
             // User exists
             user = result.Items[0];
+
+            // Check if user is blocked by admin
+            if (user.isBlocked === true) {
+                const blockedMsg = user.blockedMessage || 'Your account has been blocked by the admin. If you believe this is a mistake, please contact support.';
+                return res.status(403).json({ error: blockedMsg, blocked: true });
+            }
 
             // Update avatar if changed
             if (avatar && user.avatar !== avatar) {
