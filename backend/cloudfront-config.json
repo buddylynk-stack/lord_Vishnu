@@ -1,0 +1,57 @@
+{
+    "CallerReference": "buddylynk-api-cdn-20241220",
+    "Aliases": {
+        "Quantity": 0
+    },
+    "DefaultRootObject": "",
+    "Origins": {
+        "Quantity": 1,
+        "Items": [
+            {
+                "Id": "BuddylynkAPI",
+                "DomainName": "ec2-52-0-95-126.compute-1.amazonaws.com",
+                "CustomOriginConfig": {
+                    "HTTPPort": 3000,
+                    "HTTPSPort": 443,
+                    "OriginProtocolPolicy": "http-only",
+                    "OriginSslProtocols": {
+                        "Quantity": 1,
+                        "Items": [
+                            "TLSv1.2"
+                        ]
+                    }
+                }
+            }
+        ]
+    },
+    "DefaultCacheBehavior": {
+        "TargetOriginId": "BuddylynkAPI",
+        "ViewerProtocolPolicy": "allow-all",
+        "AllowedMethods": {
+            "Quantity": 7,
+            "Items": [
+                "GET",
+                "HEAD",
+                "OPTIONS",
+                "PUT",
+                "POST",
+                "PATCH",
+                "DELETE"
+            ],
+            "CachedMethods": {
+                "Quantity": 2,
+                "Items": [
+                    "GET",
+                    "HEAD"
+                ]
+            }
+        },
+        "CachePolicyId": "658327ea-f89d-4fab-a63d-7e88639e58f6",
+        "Compress": true
+    },
+    "Comment": "BuddyLynk API CDN for faster global access",
+    "Enabled": true,
+    "HttpVersion": "http2",
+    "IsIPV6Enabled": true,
+    "PriceClass": "PriceClass_100"
+}

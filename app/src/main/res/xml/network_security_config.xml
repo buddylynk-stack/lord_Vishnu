@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Network Security Configuration for Buddylynk
+    Production-ready security settings
+-->
+<network-security-config>
+    <!-- Default: Allow cleartext only for development, block in production -->
+    <base-config cleartextTrafficPermitted="false">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+    
+    <!-- Allow our EC2 backend (until SSL is configured) -->
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="true">52.0.95.126</domain>
+    </domain-config>
+    
+    <!-- Allow S3 for media -->
+    <domain-config cleartextTrafficPermitted="false">
+        <domain includeSubdomains="true">amazonaws.com</domain>
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </domain-config>
+</network-security-config>

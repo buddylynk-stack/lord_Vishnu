@@ -1,0 +1,15 @@
+[
+    {
+        "relation": [
+            "delegate_permission/common.handle_all_urls"
+        ],
+        "target": {
+            "namespace": "android_app",
+            "package_name": "com.orignal.buddylynk",
+            "sha256_cert_fingerprints": [
+                "86:9E:77:C2:DB:45:C7:90:13:79:78:66:F4:98:BC:57:12:2E:DD:83:A6:B1:73:5B:8D:91:79:B1:E0:94:ED:76",
+                "D0:89:AA:37:00:5F:B8:B9:45:E6:0F:76:89:DD:F8:B1:73:4E:7D:0B:CD:8E:F4:E9:86:CD:74:3E:CA:53:70:B0"
+            ]
+        }
+    }
+]

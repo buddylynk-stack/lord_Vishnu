@@ -1,0 +1,44 @@
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Sid": "DenyPublicAccess",
+            "Effect": "Deny",
+            "Principal": "*",
+            "Action": "s3:GetObject",
+            "Resource": "arn:aws:s3:::buddylynk-media-bucket-2024/*",
+            "Condition": {
+                "StringNotEquals": {
+                    "aws:PrincipalServiceName": "cloudfront.amazonaws.com"
+                },
+                "Bool": {
+                    "aws:SecureTransport": "false"
+                }
+            }
+        },
+        {
+            "Sid": "AllowCloudFrontOAC",
+            "Effect": "Allow",
+            "Principal": {
+                "Service": "cloudfront.amazonaws.com"
+            },
+            "Action": "s3:GetObject",
+            "Resource": "arn:aws:s3:::buddylynk-media-bucket-2024/*"
+        },
+        {
+            "Sid": "AllowPresignedURLs",
+            "Effect": "Allow",
+            "Principal": "*",
+            "Action": [
+                "s3:GetObject",
+                "s3:PutObject"
+            ],
+            "Resource": "arn:aws:s3:::buddylynk-media-bucket-2024/*",
+            "Condition": {
+                "StringEquals": {
+                    "s3:authType": "REST-QUERY-STRING"
+                }
+            }
+        }
+    ]
+}
