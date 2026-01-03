@@ -4,6 +4,7 @@ const { PutCommand, ScanCommand, UpdateCommand, GetCommand } = require('@aws-sdk
 const { docClient, Tables } = require('../config/aws');
 const { verifyToken } = require('../middleware/auth');
 const { convertMessageMediaUrls } = require('../utils/cloudfront');
+const { sendMessageNotification, getUserFcmToken } = require('../services/fcm');
 
 const router = express.Router();
 
@@ -97,6 +98,25 @@ router.post('/:userId', verifyToken, async (req, res) => {
             TableName: Tables.MESSAGES,
             Item: message
         }));
+
+        // Send push notification to receiver (async, don't block response)
+        (async () => {
+            try {
+                // Get sender info for notification
+                const senderResult = await docClient.send(new GetCommand({
+                    TableName: Tables.USERS,
+                    Key: { userId: req.userId },
+                    ProjectionExpression: 'username, fullName'
+                }));
+                const sender = senderResult.Item || {};
+                const senderName = sender.fullName || sender.username || 'Someone';
+
+                await sendMessageNotification(receiverId, req.userId, senderName, content || 'Sent you a message');
+                console.log(`Push notification sent for message to ${receiverId}`);
+            } catch (e) {
+                console.error('Failed to send message notification:', e);
+            }
+        })();
 
         res.status(201).json(message);
     } catch (err) {

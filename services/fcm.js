@@ -10,12 +10,12 @@ const path = require('path');
 let admin = null;
 try {
     admin = require('firebase-admin');
-    
+
     // Initialize Firebase Admin with service account
     if (!admin.apps.length) {
         const serviceAccountPath = path.join(__dirname, '..', 'firebase-service-account.json');
         const serviceAccount = require(serviceAccountPath);
-        
+
         admin.initializeApp({
             credential: admin.credential.cert(serviceAccount)
         });
@@ -131,10 +131,61 @@ async function sendMessageNotification(targetUserId, senderId, senderName, conte
         console.error('Error sending message notification:', e);
         return false;
     }
-}
+    /**
+     * Send generic push notification
+     * Used for likes, follows, comments, etc.
+     */
+    async function sendNotification(targetUserId, title, body, data = {}) {
+        if (!admin) {
+            console.log('Firebase Admin not available - cannot send push notification');
+            return false;
+        }
 
-module.exports = {
-    sendCallNotification,
-    sendMessageNotification,
-    getUserFcmToken
-};
+        const targetUser = await getUserFcmToken(targetUserId);
+        if (!targetUser || !targetUser.fcmToken) {
+            console.log(`No FCM token for user ${targetUserId}`);
+            return false;
+        }
+
+        try {
+            const message = {
+                token: targetUser.fcmToken,
+                notification: {
+                    title: title,
+                    body: body
+                },
+                data: {
+                    type: data.type || 'notification',
+                    ...Object.fromEntries(
+                        Object.entries(data).map(([k, v]) => [k, String(v)])
+                    )
+                },
+                android: {
+                    priority: 'high',
+                    notification: {
+                        channelId: 'buddylynk_messages',
+                        icon: 'ic_notification'
+                    }
+                }
+            };
+
+            const response = await admin.messaging().send(message);
+            console.log(`Notification sent to ${targetUserId}:`, response);
+            return true;
+        } catch (e) {
+            console.error('Error sending notification:', e);
+            // If token is invalid, we could clean it up
+            if (e.code === 'messaging/invalid-registration-token' ||
+                e.code === 'messaging/registration-token-not-registered') {
+                console.log(`Invalid FCM token for user ${targetUserId}, should clean up`);
+            }
+            return false;
+        }
+    }
+
+    module.exports = {
+        sendCallNotification,
+        sendMessageNotification,
+        sendNotification,
+        getUserFcmToken
+    };

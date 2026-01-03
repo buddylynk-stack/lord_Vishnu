@@ -3,6 +3,7 @@ const { v4: uuidv4 } = require('uuid');
 const { PutCommand, GetCommand, QueryCommand, UpdateCommand, ScanCommand, DeleteCommand } = require('@aws-sdk/lib-dynamodb');
 const { docClient, Tables } = require('../config/aws');
 const { verifyToken } = require('../middleware/auth');
+const { sendNotification } = require('../services/fcm');
 
 const router = express.Router();
 
@@ -54,10 +55,10 @@ function convertPostMediaUrls(post) {
     return post;
 }
 
-// Simple in-memory cache for feed
+// Simple in-memory cache for feed - DISABLED for variety (shuffle every request)
 let feedCache = null;
 let feedCacheTime = 0;
-const CACHE_TTL = 5000; // 5 seconds - short TTL for fresh content
+const CACHE_TTL = 0; // 0 = disabled - shuffle on every request for fresh content
 
 // Function to clear feed cache (called when NSFW flags change)
 function clearFeedCache() {
@@ -109,20 +110,25 @@ router.get('/feed', async (req, res) => {
     try {
         const now = Date.now();
         const userId = req.headers['x-user-id'] || req.query.userId;
+        const limit = parseInt(req.query.limit) || 100; // Default 100 posts for fast loading
+        const offset = parseInt(req.query.offset) || 0;
 
         // Try algorithm-based recommendations for logged-in users
         let algorithmRecommendations = null;
         if (userId) {
             console.log(`[Feed] Fetching recommendations for user: ${userId.substring(0, 8)}...`);
-            algorithmRecommendations = await fetchRecommendations(userId, 50);
+            algorithmRecommendations = await fetchRecommendations(userId, limit);
         }
 
-        // Get ALL posts from database using pagination (DynamoDB returns max 1MB per scan)
+        // Get posts from database - limit to 200 max per request for speed
+        const maxScan = Math.min(limit + 50, 200); // Fetch slightly more for variety
         let allPosts = [];
         let lastEvaluatedKey = undefined;
+        let scanCount = 0;
         do {
             const scanParams = {
                 TableName: Tables.POSTS,
+                Limit: 100, // Limit each scan for speed
             };
             if (lastEvaluatedKey) {
                 scanParams.ExclusiveStartKey = lastEvaluatedKey;
@@ -229,13 +235,12 @@ router.get('/feed', async (req, res) => {
             }
         }
 
-        // NO LIMIT - return all posts for unlimited feed
-        // sortedPosts = sortedPosts.slice(0, 50); // REMOVED
-
         // Cache the result (short TTL for freshness)
         feedCache = sortedPosts;
         feedCacheTime = now;
 
+        // Return all posts - Android app handles progressive display
+        console.log(`[Feed] Returning ${sortedPosts.length} posts`);
         res.json(sortedPosts);
     } catch (err) {
         console.error('Feed error:', err);
@@ -313,6 +318,38 @@ router.post('/:postId/like', verifyToken, async (req, res) => {
                 ':user': [userId]
             }
         }));
+
+        // Send push notification to post owner (async)
+        (async () => {
+            try {
+                // Get post to find owner
+                const postResult = await docClient.send(new GetCommand({
+                    TableName: Tables.POSTS,
+                    Key: { postId },
+                    ProjectionExpression: 'userId'
+                }));
+                const postOwnerId = postResult.Item?.userId;
+                if (!postOwnerId || postOwnerId === userId) return; // Don't notify self
+
+                // Get liker info
+                const likerResult = await docClient.send(new GetCommand({
+                    TableName: Tables.USERS,
+                    Key: { userId: userId },
+                    ProjectionExpression: 'username, fullName'
+                }));
+                const liker = likerResult.Item || {};
+                const likerName = liker.fullName || liker.username || 'Someone';
+
+                await sendNotification(
+                    postOwnerId,
+                    '❤️ New Like!',
+                    `${likerName} liked your post`,
+                    { type: 'like', postId: postId, userId: userId }
+                );
+            } catch (e) {
+                console.error('Failed to send like notification:', e);
+            }
+        })();
 
         res.json({ success: true });
     } catch (err) {
@@ -407,6 +444,38 @@ router.post('/:postId/comment', verifyToken, async (req, res) => {
                 ':comment': [comment]
             }
         }));
+
+        // Send push notification to post owner (async)
+        (async () => {
+            try {
+                // Get post to find owner
+                const postResult = await docClient.send(new GetCommand({
+                    TableName: Tables.POSTS,
+                    Key: { postId },
+                    ProjectionExpression: 'userId'
+                }));
+                const postOwnerId = postResult.Item?.userId;
+                if (!postOwnerId || postOwnerId === userId) return; // Don't notify self
+
+                // Get commenter info
+                const commenterResult = await docClient.send(new GetCommand({
+                    TableName: Tables.USERS,
+                    Key: { userId: userId },
+                    ProjectionExpression: 'username, fullName'
+                }));
+                const commenter = commenterResult.Item || {};
+                const commenterName = commenter.fullName || commenter.username || 'Someone';
+
+                await sendNotification(
+                    postOwnerId,
+                    '💬 New Comment!',
+                    `${commenterName}: ${text.substring(0, 50)}...`,
+                    { type: 'comment', postId: postId, userId: userId }
+                );
+            } catch (e) {
+                console.error('Failed to send comment notification:', e);
+            }
+        })();
 
         res.json({ success: true, comment });
     } catch (err) {
