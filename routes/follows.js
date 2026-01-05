@@ -12,37 +12,42 @@ router.post('/:userId', verifyToken, async (req, res) => {
         const targetUserId = req.params.userId;
         const followerId = req.userId;
 
+        console.log(`Follow request: ${followerId} following ${targetUserId}`);
+
         if (targetUserId === followerId) {
             return res.status(400).json({ error: 'Cannot follow yourself' });
         }
 
-        const followId = `${followerId}_${targetUserId}`;
-
+        // Use composite key: followerId (HASH) + followingId (RANGE)
         await docClient.send(new PutCommand({
             TableName: Tables.FOLLOWS,
             Item: {
-                followId,
-                followerId,
+                followerId: followerId,
                 followingId: targetUserId,
                 createdAt: new Date().toISOString()
             }
         }));
 
         // Update follower/following counts
-        await docClient.send(new UpdateCommand({
-            TableName: Tables.USERS,
-            Key: { userId: targetUserId },
-            UpdateExpression: 'SET followerCount = if_not_exists(followerCount, :zero) + :inc',
-            ExpressionAttributeValues: { ':inc': 1, ':zero': 0 }
-        }));
+        try {
+            await docClient.send(new UpdateCommand({
+                TableName: Tables.USERS,
+                Key: { userId: targetUserId },
+                UpdateExpression: 'SET followerCount = if_not_exists(followerCount, :zero) + :inc',
+                ExpressionAttributeValues: { ':inc': 1, ':zero': 0 }
+            }));
+        } catch (e) { console.log('Could not update target followerCount:', e.message); }
 
-        await docClient.send(new UpdateCommand({
-            TableName: Tables.USERS,
-            Key: { userId: followerId },
-            UpdateExpression: 'SET followingCount = if_not_exists(followingCount, :zero) + :inc',
-            ExpressionAttributeValues: { ':inc': 1, ':zero': 0 }
-        }));
+        try {
+            await docClient.send(new UpdateCommand({
+                TableName: Tables.USERS,
+                Key: { userId: followerId },
+                UpdateExpression: 'SET followingCount = if_not_exists(followingCount, :zero) + :inc',
+                ExpressionAttributeValues: { ':inc': 1, ':zero': 0 }
+            }));
+        } catch (e) { console.log('Could not update follower followingCount:', e.message); }
 
+        console.log('Follow successful');
         res.json({ success: true });
     } catch (err) {
         console.error('Follow error:', err);
@@ -55,28 +60,38 @@ router.delete('/:userId', verifyToken, async (req, res) => {
     try {
         const targetUserId = req.params.userId;
         const followerId = req.userId;
-        const followId = `${followerId}_${targetUserId}`;
 
+        console.log(`Unfollow: ${followerId} unfollowing ${targetUserId}`);
+
+        // Use composite key: followerId (HASH) + followingId (RANGE)
         await docClient.send(new DeleteCommand({
             TableName: Tables.FOLLOWS,
-            Key: { followId }
+            Key: {
+                followerId: followerId,
+                followingId: targetUserId
+            }
         }));
 
-        // Update counts
-        await docClient.send(new UpdateCommand({
-            TableName: Tables.USERS,
-            Key: { userId: targetUserId },
-            UpdateExpression: 'SET followerCount = followerCount - :dec',
-            ExpressionAttributeValues: { ':dec': 1 }
-        }));
+        // Update counts - wrap in try-catch to not fail if counts don't exist
+        try {
+            await docClient.send(new UpdateCommand({
+                TableName: Tables.USERS,
+                Key: { userId: targetUserId },
+                UpdateExpression: 'SET followerCount = if_not_exists(followerCount, :one) - :dec',
+                ExpressionAttributeValues: { ':dec': 1, ':one': 1 }
+            }));
+        } catch (e) { console.log('Could not update target followerCount:', e.message); }
 
-        await docClient.send(new UpdateCommand({
-            TableName: Tables.USERS,
-            Key: { userId: followerId },
-            UpdateExpression: 'SET followingCount = followingCount - :dec',
-            ExpressionAttributeValues: { ':dec': 1 }
-        }));
+        try {
+            await docClient.send(new UpdateCommand({
+                TableName: Tables.USERS,
+                Key: { userId: followerId },
+                UpdateExpression: 'SET followingCount = if_not_exists(followingCount, :one) - :dec',
+                ExpressionAttributeValues: { ':dec': 1, ':one': 1 }
+            }));
+        } catch (e) { console.log('Could not update follower followingCount:', e.message); }
 
+        console.log('Unfollow successful');
         res.json({ success: true });
     } catch (err) {
         console.error('Unfollow error:', err);
@@ -119,10 +134,13 @@ router.get('/:userId/following', async (req, res) => {
 // Check if following
 router.get('/check/:userId', verifyToken, async (req, res) => {
     try {
-        const followId = `${req.userId}_${req.params.userId}`;
+        // Use composite key: followerId (HASH) + followingId (RANGE)
         const result = await docClient.send(new GetCommand({
             TableName: Tables.FOLLOWS,
-            Key: { followId }
+            Key: {
+                followerId: req.userId,
+                followingId: req.params.userId
+            }
         }));
 
         res.json({ isFollowing: !!result.Item });

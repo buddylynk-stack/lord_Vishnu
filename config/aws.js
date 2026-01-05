@@ -19,7 +19,8 @@ const Tables = {
     EVENTS: 'Buddylynk_Events',
     SAVES: 'Buddylynk_Saves',
     GROUPS: 'Buddylynk_Groups',
-    POST_VIEWS: 'Buddylynk_PostViews'
+    POST_VIEWS: 'Buddylynk_PostViews',
+    INVITE_LINKS: 'Buddylynk_InviteLinks'
 };
 
 const S3_BUCKET = process.env.S3_BUCKET || 'buddylynk-media-bucket-2024';

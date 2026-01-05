@@ -179,4 +179,165 @@ router.post('/:groupId/messages', verifyToken, async (req, res) => {
     }
 });
 
+// ============ INVITE LINKS ============
+
+// Get invite links for a group
+router.get('/:groupId/invite-links', verifyToken, async (req, res) => {
+    try {
+        const { groupId } = req.params;
+
+        const result = await docClient.send(new ScanCommand({
+            TableName: Tables.INVITE_LINKS,
+            FilterExpression: 'groupId = :gid AND isActive = :active',
+            ExpressionAttributeValues: { ':gid': groupId, ':active': true }
+        }));
+
+        const links = (result.Items || []).map(link => ({
+            linkId: link.linkId,
+            code: link.code,
+            url: `https://app.buddylynk.com/invite/${link.code}`,
+            createdAt: link.createdAt,
+            createdBy: link.createdBy,
+            isActive: link.isActive
+        }));
+
+        res.json(links);
+    } catch (err) {
+        console.error('Get invite links error:', err);
+        res.status(500).json({ error: 'Failed to get invite links' });
+    }
+});
+
+// Create invite link
+router.post('/:groupId/invite-links', verifyToken, async (req, res) => {
+    try {
+        const { groupId } = req.params;
+        const linkId = uuidv4();
+        const code = Math.random().toString(36).substring(2, 10);
+        const now = new Date().toISOString();
+
+        const inviteLink = {
+            linkId,
+            groupId,
+            code,
+            url: `https://app.buddylynk.com/invite/${code}`,
+            createdAt: now,
+            createdBy: req.userId,
+            isActive: true
+        };
+
+        await docClient.send(new PutCommand({
+            TableName: Tables.INVITE_LINKS,
+            Item: inviteLink
+        }));
+
+        res.status(201).json(inviteLink);
+    } catch (err) {
+        console.error('Create invite link error:', err);
+        res.status(500).json({ error: 'Failed to create invite link' });
+    }
+});
+
+// Delete/revoke invite link
+router.delete('/:groupId/invite-links/:linkId', verifyToken, async (req, res) => {
+    try {
+        const { groupId, linkId } = req.params;
+        const createNew = req.query.createNew === 'true';
+
+        // Mark old link as inactive
+        await docClient.send(new UpdateCommand({
+            TableName: Tables.INVITE_LINKS,
+            Key: { linkId },
+            UpdateExpression: 'SET isActive = :inactive',
+            ExpressionAttributeValues: { ':inactive': false }
+        }));
+
+        let newLink = null;
+
+        // Create new link if requested
+        if (createNew) {
+            const newLinkId = uuidv4();
+            const code = Math.random().toString(36).substring(2, 10);
+            const now = new Date().toISOString();
+
+            newLink = {
+                linkId: newLinkId,
+                groupId,
+                code,
+                url: `https://app.buddylynk.com/invite/${code}`,
+                createdAt: now,
+                createdBy: req.userId,
+                isActive: true
+            };
+
+            await docClient.send(new PutCommand({
+                TableName: Tables.INVITE_LINKS,
+                Item: newLink
+            }));
+        }
+
+        res.json({ success: true, newLink });
+    } catch (err) {
+        console.error('Delete invite link error:', err);
+        res.status(500).json({ error: 'Failed to delete invite link' });
+    }
+});
+
+// Join group via invite link
+router.post('/join/:code', verifyToken, async (req, res) => {
+    try {
+        const { code } = req.params;
+
+        // Find the invite link
+        const linkResult = await docClient.send(new ScanCommand({
+            TableName: Tables.INVITE_LINKS,
+            FilterExpression: 'code = :code AND isActive = :active',
+            ExpressionAttributeValues: { ':code': code, ':active': true }
+        }));
+
+        if (!linkResult.Items || linkResult.Items.length === 0) {
+            return res.status(404).json({ error: 'Invalid or expired invite link' });
+        }
+
+        const inviteLink = linkResult.Items[0];
+        const groupId = inviteLink.groupId;
+
+        // Get the group
+        const groupResult = await docClient.send(new GetCommand({
+            TableName: Tables.GROUPS,
+            Key: { groupId }
+        }));
+
+        if (!groupResult.Item) {
+            return res.status(404).json({ error: 'Group not found' });
+        }
+
+        const group = groupResult.Item;
+        const memberIds = group.memberIds || [];
+
+        // Check if already a member
+        if (memberIds.includes(req.userId) || group.creatorId === req.userId) {
+            return res.json({ success: true, message: 'Already a member', group });
+        }
+
+        // Add user to group
+        await docClient.send(new UpdateCommand({
+            TableName: Tables.GROUPS,
+            Key: { groupId },
+            UpdateExpression: 'SET memberIds = list_append(if_not_exists(memberIds, :empty), :uid), memberCount = if_not_exists(memberCount, :zero) + :one',
+            ExpressionAttributeValues: {
+                ':uid': [req.userId],
+                ':empty': [],
+                ':zero': 0,
+                ':one': 1
+            }
+        }));
+
+        res.json({ success: true, message: 'Joined successfully', groupId, groupName: group.name });
+    } catch (err) {
+        console.error('Join via invite error:', err);
+        res.status(500).json({ error: 'Failed to join group' });
+    }
+});
+
 module.exports = router;
