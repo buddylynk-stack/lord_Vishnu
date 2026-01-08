@@ -9,6 +9,8 @@ const client = new DynamoDBClient({ region: process.env.AWS_REGION || 'ap-south-
 const docClient = DynamoDBDocumentClient.from(client);
 
 const OTT_TABLE = 'buddylynk-ott-videos';
+const OTT_COMMENTS_TABLE = 'buddylynk-ott-comments';
+const OTT_HISTORY_TABLE = 'buddylynk-ott-history';
 
 // ============================================================================
 // GET /api/ott/videos - Get video feed (paginated)
@@ -352,6 +354,359 @@ router.delete('/videos/:videoId', async (req, res) => {
     } catch (error) {
         console.error('Error deleting video:', error);
         res.status(500).json({ success: false, message: 'Failed to delete video' });
+    }
+});
+// ============================================================================
+// POST /api/ott/videos/:videoId/save - Save/unsave video (bookmark)
+// ============================================================================
+router.post('/videos/:videoId/save', async (req, res) => {
+    try {
+        const { videoId } = req.params;
+        const userId = req.user?.userId;
+
+        if (!userId) {
+            return res.status(401).json({ success: false, message: 'Unauthorized' });
+        }
+
+        const getResult = await docClient.send(new GetCommand({
+            TableName: OTT_TABLE,
+            Key: { videoId }
+        }));
+
+        if (!getResult.Item) {
+            return res.status(404).json({ success: false, message: 'Video not found' });
+        }
+
+        const video = getResult.Item;
+        const savedBy = video.savedBy || [];
+        const isSaved = savedBy.includes(userId);
+
+        let newSavedBy;
+        if (isSaved) {
+            newSavedBy = savedBy.filter(id => id !== userId);
+        } else {
+            newSavedBy = [...savedBy, userId];
+        }
+
+        await docClient.send(new UpdateCommand({
+            TableName: OTT_TABLE,
+            Key: { videoId },
+            UpdateExpression: 'SET savedBy = :savedBy, updatedAt = :now',
+            ExpressionAttributeValues: {
+                ':savedBy': newSavedBy,
+                ':now': new Date().toISOString()
+            }
+        }));
+
+        res.json({ success: true, isSaved: !isSaved });
+    } catch (error) {
+        console.error('Error saving video:', error);
+        res.status(500).json({ success: false, message: 'Failed to save video' });
+    }
+});
+
+// ============================================================================
+// GET /api/ott/saved - Get user's saved videos
+// ============================================================================
+router.get('/saved', async (req, res) => {
+    try {
+        const userId = req.user?.userId;
+
+        if (!userId) {
+            return res.status(401).json({ success: false, message: 'Unauthorized' });
+        }
+
+        const result = await docClient.send(new ScanCommand({
+            TableName: OTT_TABLE,
+            FilterExpression: 'contains(savedBy, :userId)',
+            ExpressionAttributeValues: { ':userId': userId }
+        }));
+
+        const videos = (result.Items || []).sort((a, b) =>
+            new Date(b.createdAt) - new Date(a.createdAt)
+        );
+
+        res.json({ success: true, videos });
+    } catch (error) {
+        console.error('Error fetching saved videos:', error);
+        res.status(500).json({ success: false, message: 'Failed to fetch saved videos' });
+    }
+});
+
+// ============================================================================
+// GET /api/ott/categories - Get available categories
+// ============================================================================
+router.get('/categories', async (req, res) => {
+    try {
+        const categories = [
+            { id: 'all', name: 'All', icon: '🎬' },
+            { id: 'entertainment', name: 'Entertainment', icon: '🎭' },
+            { id: 'music', name: 'Music', icon: '🎵' },
+            { id: 'gaming', name: 'Gaming', icon: '🎮' },
+            { id: 'sports', name: 'Sports', icon: '⚽' },
+            { id: 'education', name: 'Education', icon: '📚' },
+            { id: 'comedy', name: 'Comedy', icon: '😂' },
+            { id: 'news', name: 'News', icon: '📰' },
+            { id: 'lifestyle', name: 'Lifestyle', icon: '✨' },
+            { id: 'tech', name: 'Technology', icon: '💻' }
+        ];
+        res.json({ success: true, categories });
+    } catch (error) {
+        res.status(500).json({ success: false, message: 'Failed to fetch categories' });
+    }
+});
+
+// ============================================================================
+// GET /api/ott/creator/:creatorId - Get videos by creator
+// ============================================================================
+router.get('/creator/:creatorId', async (req, res) => {
+    try {
+        const { creatorId } = req.params;
+        const userId = req.user?.userId;
+
+        const result = await docClient.send(new ScanCommand({
+            TableName: OTT_TABLE,
+            FilterExpression: 'creatorId = :creatorId',
+            ExpressionAttributeValues: { ':creatorId': creatorId }
+        }));
+
+        const videos = (result.Items || [])
+            .map(v => ({
+                ...v,
+                isLiked: v.likedBy?.includes(userId) || false,
+                isSaved: v.savedBy?.includes(userId) || false
+            }))
+            .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+
+        res.json({ success: true, videos, count: videos.length });
+    } catch (error) {
+        console.error('Error fetching creator videos:', error);
+        res.status(500).json({ success: false, message: 'Failed to fetch creator videos' });
+    }
+});
+
+// ============================================================================
+// POST /api/ott/videos/:videoId/comments - Add comment to video
+// ============================================================================
+router.post('/videos/:videoId/comments', async (req, res) => {
+    try {
+        const { videoId } = req.params;
+        const { text } = req.body;
+        const userId = req.user?.userId;
+        const userName = req.user?.username || 'Unknown';
+        const userAvatar = req.user?.avatarUrl;
+
+        if (!userId) {
+            return res.status(401).json({ success: false, message: 'Unauthorized' });
+        }
+
+        if (!text || text.trim().length === 0) {
+            return res.status(400).json({ success: false, message: 'Comment text required' });
+        }
+
+        const commentId = uuidv4();
+        const now = new Date().toISOString();
+
+        const comment = {
+            videoId,
+            commentId,
+            userId,
+            userName,
+            userAvatar,
+            text: text.trim(),
+            likeCount: 0,
+            likedBy: [],
+            createdAt: now
+        };
+
+        await docClient.send(new PutCommand({
+            TableName: OTT_COMMENTS_TABLE,
+            Item: comment
+        }));
+
+        // Update comment count on video
+        await docClient.send(new UpdateCommand({
+            TableName: OTT_TABLE,
+            Key: { videoId },
+            UpdateExpression: 'SET commentCount = if_not_exists(commentCount, :zero) + :inc',
+            ExpressionAttributeValues: { ':zero': 0, ':inc': 1 }
+        }));
+
+        res.json({ success: true, comment });
+    } catch (error) {
+        console.error('Error adding comment:', error);
+        res.status(500).json({ success: false, message: 'Failed to add comment' });
+    }
+});
+
+// ============================================================================
+// GET /api/ott/videos/:videoId/comments - Get comments for video
+// ============================================================================
+router.get('/videos/:videoId/comments', async (req, res) => {
+    try {
+        const { videoId } = req.params;
+        const { limit = 50 } = req.query;
+
+        const result = await docClient.send(new QueryCommand({
+            TableName: OTT_COMMENTS_TABLE,
+            KeyConditionExpression: 'videoId = :videoId',
+            ExpressionAttributeValues: { ':videoId': videoId },
+            Limit: parseInt(limit),
+            ScanIndexForward: false // Newest first
+        }));
+
+        res.json({ success: true, comments: result.Items || [] });
+    } catch (error) {
+        console.error('Error fetching comments:', error);
+        res.status(500).json({ success: false, message: 'Failed to fetch comments' });
+    }
+});
+
+// ============================================================================
+// DELETE /api/ott/comments/:commentId - Delete comment
+// ============================================================================
+router.delete('/videos/:videoId/comments/:commentId', async (req, res) => {
+    try {
+        const { videoId, commentId } = req.params;
+        const userId = req.user?.userId;
+
+        // Check ownership
+        const getResult = await docClient.send(new GetCommand({
+            TableName: OTT_COMMENTS_TABLE,
+            Key: { videoId, commentId }
+        }));
+
+        if (!getResult.Item) {
+            return res.status(404).json({ success: false, message: 'Comment not found' });
+        }
+
+        if (getResult.Item.userId !== userId) {
+            return res.status(403).json({ success: false, message: 'Not authorized' });
+        }
+
+        await docClient.send(new DeleteCommand({
+            TableName: OTT_COMMENTS_TABLE,
+            Key: { videoId, commentId }
+        }));
+
+        // Decrement comment count
+        await docClient.send(new UpdateCommand({
+            TableName: OTT_TABLE,
+            Key: { videoId },
+            UpdateExpression: 'SET commentCount = commentCount - :dec',
+            ExpressionAttributeValues: { ':dec': 1 }
+        }));
+
+        res.json({ success: true, message: 'Comment deleted' });
+    } catch (error) {
+        console.error('Error deleting comment:', error);
+        res.status(500).json({ success: false, message: 'Failed to delete comment' });
+    }
+});
+
+// ============================================================================
+// POST /api/ott/videos/:videoId/history - Save watch history
+// ============================================================================
+router.post('/videos/:videoId/history', async (req, res) => {
+    try {
+        const { videoId } = req.params;
+        const { progress, duration } = req.body;
+        const userId = req.user?.userId;
+
+        if (!userId) {
+            return res.status(401).json({ success: false, message: 'Unauthorized' });
+        }
+
+        await docClient.send(new PutCommand({
+            TableName: OTT_HISTORY_TABLE,
+            Item: {
+                userId,
+                videoId,
+                progress: progress || 0,
+                duration: duration || 0,
+                watchedAt: new Date().toISOString()
+            }
+        }));
+
+        res.json({ success: true });
+    } catch (error) {
+        console.error('Error saving watch history:', error);
+        res.status(500).json({ success: false, message: 'Failed to save history' });
+    }
+});
+
+// ============================================================================
+// GET /api/ott/history - Get user's watch history
+// ============================================================================
+router.get('/history', async (req, res) => {
+    try {
+        const userId = req.user?.userId;
+        const { limit = 20 } = req.query;
+
+        if (!userId) {
+            return res.status(401).json({ success: false, message: 'Unauthorized' });
+        }
+
+        const result = await docClient.send(new QueryCommand({
+            TableName: OTT_HISTORY_TABLE,
+            KeyConditionExpression: 'userId = :userId',
+            ExpressionAttributeValues: { ':userId': userId },
+            Limit: parseInt(limit),
+            ScanIndexForward: false
+        }));
+
+        // Fetch video details for each history item
+        const historyWithVideos = await Promise.all(
+            (result.Items || []).map(async (item) => {
+                try {
+                    const videoResult = await docClient.send(new GetCommand({
+                        TableName: OTT_TABLE,
+                        Key: { videoId: item.videoId }
+                    }));
+                    return { ...item, video: videoResult.Item };
+                } catch {
+                    return item;
+                }
+            })
+        );
+
+        res.json({ success: true, history: historyWithVideos });
+    } catch (error) {
+        console.error('Error fetching watch history:', error);
+        res.status(500).json({ success: false, message: 'Failed to fetch history' });
+    }
+});
+
+// ============================================================================
+// POST /api/ott/videos/:videoId/report - Report video
+// ============================================================================
+router.post('/videos/:videoId/report', async (req, res) => {
+    try {
+        const { videoId } = req.params;
+        const { reason } = req.body;
+        const userId = req.user?.userId;
+
+        if (!userId) {
+            return res.status(401).json({ success: false, message: 'Unauthorized' });
+        }
+
+        // Add to reported list on video
+        await docClient.send(new UpdateCommand({
+            TableName: OTT_TABLE,
+            Key: { videoId },
+            UpdateExpression: 'SET reportedBy = list_append(if_not_exists(reportedBy, :empty), :report), reportCount = if_not_exists(reportCount, :zero) + :inc',
+            ExpressionAttributeValues: {
+                ':empty': [],
+                ':report': [{ userId, reason: reason || 'Inappropriate content', reportedAt: new Date().toISOString() }],
+                ':zero': 0,
+                ':inc': 1
+            }
+        }));
+
+        res.json({ success: true, message: 'Video reported' });
+    } catch (error) {
+        console.error('Error reporting video:', error);
+        res.status(500).json({ success: false, message: 'Failed to report video' });
     }
 });
 

@@ -15,7 +15,7 @@ router.post('/presign', verifyToken, async (req, res) => {
             return res.status(400).json({ error: 'Filename and contentType required' });
         }
 
-        const validFolders = ['profiles', 'posts', 'stories', 'messages', 'groups'];
+        const validFolders = ['profiles', 'posts', 'stories', 'messages', 'groups', 'ott'];
         const safeFolder = validFolders.includes(folder) ? folder : 'uploads';
 
         // Generate unique key
