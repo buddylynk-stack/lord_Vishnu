@@ -19,6 +19,8 @@ const groupRoutes = require('./routes/groups');
 const blockRoutes = require('./routes/blocks');
 const nsfwRoutes = require('./routes/nsfw');
 const behaviorRoutes = require('./routes/behavior');
+const eventRoutes = require('./routes/events');
+const ottRoutes = require('./routes/ott');
 const { initializeSignaling } = require('./services/signaling');
 
 const app = express();
@@ -120,6 +122,8 @@ app.use('/api/groups', groupRoutes);
 app.use('/api/blocks', blockRoutes);
 app.use('/api/nsfw', nsfwRoutes); // Admin NSFW content flagging
 app.use('/api/behavior', behaviorRoutes); // MindFlow algorithm behavior tracking
+app.use('/api/events', eventRoutes); // Event management and chat
+app.use('/api/ott', ottRoutes); // OTT video streaming platform
 
 // Deep Link routes - redirect to app or show landing page
 app.get('/post/:postId', (req, res) => {
