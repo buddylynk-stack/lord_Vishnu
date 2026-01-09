@@ -3,6 +3,7 @@ const router = express.Router();
 const { DynamoDBClient } = require('@aws-sdk/client-dynamodb');
 const { DynamoDBDocumentClient, GetCommand, PutCommand, UpdateCommand, QueryCommand, ScanCommand, DeleteCommand } = require('@aws-sdk/lib-dynamodb');
 const { v4: uuidv4 } = require('uuid');
+const { verifyToken } = require('../middleware/auth');
 
 // Initialize DynamoDB
 const client = new DynamoDBClient({ region: process.env.AWS_REGION || 'ap-south-1' });
@@ -158,13 +159,15 @@ router.post('/videos', async (req, res) => {
 // ============================================================================
 // DELETE /api/ott/videos/:videoId - Delete video (creator only) with S3 cleanup
 // ============================================================================
-router.delete('/videos/:videoId', async (req, res) => {
+router.delete('/videos/:videoId', verifyToken, async (req, res) => {
     try {
         const { videoId } = req.params;
-        const userId = req.user?.userId;
+        const userId = req.userId; // verifyToken sets req.userId
+
+        console.log(`Delete request: videoId=${videoId}, userId=${userId}`);
 
         if (!userId) {
-            return res.status(401).json({ success: false, message: 'Unauthorized' });
+            return res.status(401).json({ success: false, message: 'Unauthorized - no user ID' });
         }
 
         // Get video to verify ownership and get URLs for S3 deletion
@@ -178,9 +181,11 @@ router.delete('/videos/:videoId', async (req, res) => {
         }
 
         const video = getResult.Item;
+        console.log(`Video creatorId=${video.creatorId}, requesting userId=${userId}`);
 
         // Verify ownership - only creator can delete
         if (video.creatorId !== userId) {
+            console.log(`Authorization failed: ${video.creatorId} !== ${userId}`);
             return res.status(403).json({ success: false, message: 'You can only delete your own videos' });
         }
 
