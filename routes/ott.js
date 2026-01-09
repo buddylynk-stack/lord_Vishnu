@@ -9,9 +9,7 @@ const { verifyToken } = require('../middleware/auth');
 const client = new DynamoDBClient({ region: process.env.AWS_REGION || 'ap-south-1' });
 const docClient = DynamoDBDocumentClient.from(client);
 
-const OTT_TABLE = 'buddylynk-ott-videos';
-const OTT_COMMENTS_TABLE = 'buddylynk-ott-comments';
-const OTT_HISTORY_TABLE = 'buddylynk-ott-history';
+const OTT_TABLE = 'buddylynk-ott-videos'; // Single table for all OTT data
 
 // ============================================================================
 // GET /api/ott/videos - Get video feed (paginated)
@@ -244,23 +242,7 @@ router.delete('/videos/:videoId', verifyToken, async (req, res) => {
             Key: { videoId }
         }));
 
-        // Also delete all comments for this video
-        try {
-            const commentsResult = await docClient.send(new QueryCommand({
-                TableName: OTT_COMMENTS_TABLE,
-                KeyConditionExpression: 'videoId = :vid',
-                ExpressionAttributeValues: { ':vid': videoId }
-            }));
-
-            for (const comment of (commentsResult.Items || [])) {
-                await docClient.send(new DeleteCommand({
-                    TableName: OTT_COMMENTS_TABLE,
-                    Key: { videoId: comment.videoId, commentId: comment.commentId }
-                }));
-            }
-        } catch (commentError) {
-            console.error('Error deleting comments:', commentError);
-        }
+        // Comments are stored in the video document as an array, so they're deleted with the video
 
         res.json({ success: true, message: 'Video deleted successfully' });
     } catch (error) {
@@ -330,12 +312,14 @@ router.post('/videos/:videoId/like', async (req, res) => {
 });
 
 // ============================================================================
-// POST /api/ott/videos/:videoId/view - Increment view count
+// POST /api/ott/videos/:videoId/view - Increment view count and track in history
 // ============================================================================
 router.post('/videos/:videoId/view', async (req, res) => {
     try {
         const { videoId } = req.params;
+        const userId = req.user?.userId;
 
+        // Increment view count
         await docClient.send(new UpdateCommand({
             TableName: OTT_TABLE,
             Key: { videoId },
@@ -345,6 +329,27 @@ router.post('/videos/:videoId/view', async (req, res) => {
                 ':inc': 1
             }
         }));
+
+        // Track in watchedBy for history (only if logged in)
+        if (userId) {
+            const video = await docClient.send(new GetCommand({
+                TableName: OTT_TABLE,
+                Key: { videoId }
+            }));
+
+            const watchedBy = video.Item?.watchedBy || [];
+            if (!watchedBy.includes(userId)) {
+                await docClient.send(new UpdateCommand({
+                    TableName: OTT_TABLE,
+                    Key: { videoId },
+                    UpdateExpression: 'SET watchedBy = list_append(if_not_exists(watchedBy, :empty), :user)',
+                    ExpressionAttributeValues: {
+                        ':empty': [],
+                        ':user': [userId]
+                    }
+                }));
+            }
+        }
 
         res.json({ success: true });
     } catch (error) {
@@ -836,8 +841,31 @@ router.post('/videos/:videoId/report', async (req, res) => {
 });
 
 // ============================================================================
-// SAVED VIDEOS APIs
+// SAVED VIDEOS & WATCH HISTORY APIs (uses arrays in main OTT_TABLE)
 // ============================================================================
+
+// GET /api/ott/history - Get user's watch history (uses watchedBy array in videos table)
+router.get('/history', verifyToken, async (req, res) => {
+    try {
+        const userId = req.userId;
+
+        // Scan all videos and filter by watchedBy array containing userId
+        const result = await docClient.send(new ScanCommand({
+            TableName: OTT_TABLE,
+            FilterExpression: 'contains(watchedBy, :uid)',
+            ExpressionAttributeValues: { ':uid': userId }
+        }));
+
+        const videos = (result.Items || []).sort((a, b) =>
+            new Date(b.updatedAt || b.createdAt) - new Date(a.updatedAt || a.createdAt)
+        );
+
+        res.json({ success: true, videos, count: videos.length });
+    } catch (error) {
+        console.error('Error fetching watch history:', error);
+        res.status(500).json({ success: false, message: 'Failed to fetch history' });
+    }
+});
 
 // GET /api/ott/saved - Get user's saved videos (uses savedBy array in videos table)
 router.get('/saved', verifyToken, async (req, res) => {
