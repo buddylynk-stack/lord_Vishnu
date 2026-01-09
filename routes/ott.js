@@ -835,4 +835,108 @@ router.post('/videos/:videoId/report', async (req, res) => {
     }
 });
 
+// ============================================================================
+// SAVED VIDEOS APIs
+// ============================================================================
+
+const OTT_SAVED_TABLE = 'buddylynk-ott-saved';
+
+// GET /api/ott/saved - Get user's saved videos
+router.get('/saved', verifyToken, async (req, res) => {
+    try {
+        const userId = req.userId;
+
+        // Get saved video IDs
+        const savedResult = await docClient.send(new QueryCommand({
+            TableName: OTT_SAVED_TABLE,
+            KeyConditionExpression: 'userId = :uid',
+            ExpressionAttributeValues: { ':uid': userId },
+            ScanIndexForward: false // Newest first
+        }));
+
+        const savedItems = savedResult.Items || [];
+
+        // Get full video details for each saved video
+        const videos = [];
+        for (const item of savedItems) {
+            try {
+                const videoResult = await docClient.send(new GetCommand({
+                    TableName: OTT_TABLE,
+                    Key: { videoId: item.videoId }
+                }));
+                if (videoResult.Item) {
+                    videos.push({
+                        ...videoResult.Item,
+                        savedAt: item.savedAt,
+                        isSaved: true
+                    });
+                }
+            } catch (e) {
+                console.log('Video not found:', item.videoId);
+            }
+        }
+
+        res.json({ success: true, videos, count: videos.length });
+    } catch (error) {
+        console.error('Error fetching saved videos:', error);
+        res.status(500).json({ success: false, message: 'Failed to fetch saved videos' });
+    }
+});
+
+// POST /api/ott/videos/:videoId/save - Save/unsave a video
+router.post('/videos/:videoId/save', verifyToken, async (req, res) => {
+    try {
+        const { videoId } = req.params;
+        const userId = req.userId;
+
+        // Check if already saved
+        const existingResult = await docClient.send(new GetCommand({
+            TableName: OTT_SAVED_TABLE,
+            Key: { userId, videoId }
+        }));
+
+        if (existingResult.Item) {
+            // Already saved - remove it
+            await docClient.send(new DeleteCommand({
+                TableName: OTT_SAVED_TABLE,
+                Key: { userId, videoId }
+            }));
+            res.json({ success: true, saved: false, message: 'Video removed from saved' });
+        } else {
+            // Not saved - add it
+            await docClient.send(new PutCommand({
+                TableName: OTT_SAVED_TABLE,
+                Item: {
+                    userId,
+                    videoId,
+                    savedAt: new Date().toISOString()
+                }
+            }));
+            res.json({ success: true, saved: true, message: 'Video saved' });
+        }
+    } catch (error) {
+        console.error('Error saving video:', error);
+        res.status(500).json({ success: false, message: 'Failed to save video' });
+    }
+});
+
+// GET /api/ott/videos/:videoId/save-status - Check if video is saved
+router.get('/videos/:videoId/save-status', verifyToken, async (req, res) => {
+    try {
+        const { videoId } = req.params;
+        const userId = req.userId;
+
+        const result = await docClient.send(new GetCommand({
+            TableName: OTT_SAVED_TABLE,
+            Key: { userId, videoId }
+        }));
+
+        res.json({ success: true, saved: !!result.Item });
+    } catch (error) {
+        console.error('Error checking save status:', error);
+        res.status(500).json({ success: false, message: 'Failed to check save status' });
+    }
+});
+
 module.exports = router;
+
