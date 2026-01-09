@@ -839,42 +839,22 @@ router.post('/videos/:videoId/report', async (req, res) => {
 // SAVED VIDEOS APIs
 // ============================================================================
 
-const OTT_SAVED_TABLE = 'buddylynk-ott-saved';
-
-// GET /api/ott/saved - Get user's saved videos
+// GET /api/ott/saved - Get user's saved videos (uses savedBy array in videos table)
 router.get('/saved', verifyToken, async (req, res) => {
     try {
         const userId = req.userId;
 
-        // Get saved video IDs
-        const savedResult = await docClient.send(new QueryCommand({
-            TableName: OTT_SAVED_TABLE,
-            KeyConditionExpression: 'userId = :uid',
-            ExpressionAttributeValues: { ':uid': userId },
-            ScanIndexForward: false // Newest first
+        // Scan all videos and filter by savedBy array containing userId
+        const result = await docClient.send(new ScanCommand({
+            TableName: OTT_TABLE,
+            FilterExpression: 'contains(savedBy, :uid)',
+            ExpressionAttributeValues: { ':uid': userId }
         }));
 
-        const savedItems = savedResult.Items || [];
-
-        // Get full video details for each saved video
-        const videos = [];
-        for (const item of savedItems) {
-            try {
-                const videoResult = await docClient.send(new GetCommand({
-                    TableName: OTT_TABLE,
-                    Key: { videoId: item.videoId }
-                }));
-                if (videoResult.Item) {
-                    videos.push({
-                        ...videoResult.Item,
-                        savedAt: item.savedAt,
-                        isSaved: true
-                    });
-                }
-            } catch (e) {
-                console.log('Video not found:', item.videoId);
-            }
-        }
+        const videos = (result.Items || []).map(v => ({
+            ...v,
+            isSaved: true
+        })).sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
 
         res.json({ success: true, videos, count: videos.length });
     } catch (error) {
@@ -889,27 +869,40 @@ router.post('/videos/:videoId/save', verifyToken, async (req, res) => {
         const { videoId } = req.params;
         const userId = req.userId;
 
-        // Check if already saved
-        const existingResult = await docClient.send(new GetCommand({
-            TableName: OTT_SAVED_TABLE,
-            Key: { userId, videoId }
+        // Get current video
+        const getResult = await docClient.send(new GetCommand({
+            TableName: OTT_TABLE,
+            Key: { videoId }
         }));
 
-        if (existingResult.Item) {
-            // Already saved - remove it
-            await docClient.send(new DeleteCommand({
-                TableName: OTT_SAVED_TABLE,
-                Key: { userId, videoId }
+        if (!getResult.Item) {
+            return res.status(404).json({ success: false, message: 'Video not found' });
+        }
+
+        const video = getResult.Item;
+        const savedBy = video.savedBy || [];
+        const isSaved = savedBy.includes(userId);
+
+        if (isSaved) {
+            // Remove from savedBy
+            await docClient.send(new UpdateCommand({
+                TableName: OTT_TABLE,
+                Key: { videoId },
+                UpdateExpression: 'SET savedBy = :newList',
+                ExpressionAttributeValues: {
+                    ':newList': savedBy.filter(id => id !== userId)
+                }
             }));
             res.json({ success: true, saved: false, message: 'Video removed from saved' });
         } else {
-            // Not saved - add it
-            await docClient.send(new PutCommand({
-                TableName: OTT_SAVED_TABLE,
-                Item: {
-                    userId,
-                    videoId,
-                    savedAt: new Date().toISOString()
+            // Add to savedBy
+            await docClient.send(new UpdateCommand({
+                TableName: OTT_TABLE,
+                Key: { videoId },
+                UpdateExpression: 'SET savedBy = list_append(if_not_exists(savedBy, :empty), :user)',
+                ExpressionAttributeValues: {
+                    ':empty': [],
+                    ':user': [userId]
                 }
             }));
             res.json({ success: true, saved: true, message: 'Video saved' });
@@ -927,11 +920,12 @@ router.get('/videos/:videoId/save-status', verifyToken, async (req, res) => {
         const userId = req.userId;
 
         const result = await docClient.send(new GetCommand({
-            TableName: OTT_SAVED_TABLE,
-            Key: { userId, videoId }
+            TableName: OTT_TABLE,
+            Key: { videoId }
         }));
 
-        res.json({ success: true, saved: !!result.Item });
+        const savedBy = result.Item?.savedBy || [];
+        res.json({ success: true, saved: savedBy.includes(userId) });
     } catch (error) {
         console.error('Error checking save status:', error);
         res.status(500).json({ success: false, message: 'Failed to check save status' });
@@ -939,4 +933,5 @@ router.get('/videos/:videoId/save-status', verifyToken, async (req, res) => {
 });
 
 module.exports = router;
+
 
