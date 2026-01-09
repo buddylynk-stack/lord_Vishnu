@@ -17,12 +17,12 @@ const OTT_HISTORY_TABLE = 'buddylynk-ott-history';
 // ============================================================================
 router.get('/videos', async (req, res) => {
     try {
-        const { category, limit = 20, lastKey } = req.query;
+        const { category, limit = 50, lastKey } = req.query;
         const userId = req.user?.userId;
 
+        // Scan all videos (no limit on initial scan to get all items)
         let params = {
-            TableName: OTT_TABLE,
-            Limit: parseInt(limit)
+            TableName: OTT_TABLE
         };
 
         // Filter by category if provided
@@ -35,15 +35,27 @@ router.get('/videos', async (req, res) => {
             params.ExclusiveStartKey = JSON.parse(Buffer.from(lastKey, 'base64').toString());
         }
 
-        const result = await docClient.send(new ScanCommand(params));
+        // Fetch all items (DynamoDB may paginate, so we handle that)
+        let allItems = [];
+        let lastEvaluatedKey = null;
+
+        do {
+            const result = await docClient.send(new ScanCommand(params));
+            allItems = allItems.concat(result.Items || []);
+            lastEvaluatedKey = result.LastEvaluatedKey;
+            params.ExclusiveStartKey = lastEvaluatedKey;
+        } while (lastEvaluatedKey && allItems.length < 100); // Get up to 100 videos
 
         // Sort by createdAt descending
-        const videos = (result.Items || []).sort((a, b) =>
+        const videos = allItems.sort((a, b) =>
             new Date(b.createdAt) - new Date(a.createdAt)
         );
 
+        // Apply limit after sorting
+        const limitedVideos = videos.slice(0, parseInt(limit));
+
         // Add isLiked status for current user
-        const videosWithStatus = videos.map(video => ({
+        const videosWithStatus = limitedVideos.map(video => ({
             ...video,
             isLiked: video.likedBy?.includes(userId) || false
         }));
@@ -51,9 +63,8 @@ router.get('/videos', async (req, res) => {
         res.json({
             success: true,
             videos: videosWithStatus,
-            lastKey: result.LastEvaluatedKey
-                ? Buffer.from(JSON.stringify(result.LastEvaluatedKey)).toString('base64')
-                : null
+            total: videos.length,
+            lastKey: null // Simplified - no pagination for now
         });
     } catch (error) {
         console.error('Error fetching OTT videos:', error);
@@ -141,6 +152,115 @@ router.post('/videos', async (req, res) => {
     } catch (error) {
         console.error('Error uploading video:', error);
         res.status(500).json({ success: false, message: 'Failed to upload video' });
+    }
+});
+
+// ============================================================================
+// DELETE /api/ott/videos/:videoId - Delete video (creator only) with S3 cleanup
+// ============================================================================
+router.delete('/videos/:videoId', async (req, res) => {
+    try {
+        const { videoId } = req.params;
+        const userId = req.user?.userId;
+
+        if (!userId) {
+            return res.status(401).json({ success: false, message: 'Unauthorized' });
+        }
+
+        // Get video to verify ownership and get URLs for S3 deletion
+        const getResult = await docClient.send(new GetCommand({
+            TableName: OTT_TABLE,
+            Key: { videoId }
+        }));
+
+        if (!getResult.Item) {
+            return res.status(404).json({ success: false, message: 'Video not found' });
+        }
+
+        const video = getResult.Item;
+
+        // Verify ownership - only creator can delete
+        if (video.creatorId !== userId) {
+            return res.status(403).json({ success: false, message: 'You can only delete your own videos' });
+        }
+
+        // Delete from S3 (video and thumbnail)
+        const { S3Client, DeleteObjectCommand } = require('@aws-sdk/client-s3');
+        const s3Client = new S3Client({ region: process.env.AWS_REGION || 'ap-south-1' });
+        const bucketName = process.env.S3_BUCKET || 'buddylynk-uploads';
+
+        // Extract S3 keys from URLs
+        const extractS3Key = (url) => {
+            if (!url) return null;
+            try {
+                // Handle CloudFront URLs: https://cdn.buddylynk.com/ott/file.mp4
+                // Handle S3 URLs: https://bucket.s3.amazonaws.com/ott/file.mp4
+                const urlObj = new URL(url);
+                let key = urlObj.pathname.replace(/^\//, ''); // Remove leading slash
+                return key || null;
+            } catch (e) {
+                return null;
+            }
+        };
+
+        const videoKey = extractS3Key(video.videoUrl);
+        const thumbnailKey = extractS3Key(video.thumbnailUrl);
+
+        // Delete video file from S3
+        if (videoKey) {
+            try {
+                await s3Client.send(new DeleteObjectCommand({
+                    Bucket: bucketName,
+                    Key: videoKey
+                }));
+                console.log(`Deleted video from S3: ${videoKey}`);
+            } catch (s3Error) {
+                console.error('Error deleting video from S3:', s3Error);
+                // Continue even if S3 delete fails
+            }
+        }
+
+        // Delete thumbnail from S3
+        if (thumbnailKey) {
+            try {
+                await s3Client.send(new DeleteObjectCommand({
+                    Bucket: bucketName,
+                    Key: thumbnailKey
+                }));
+                console.log(`Deleted thumbnail from S3: ${thumbnailKey}`);
+            } catch (s3Error) {
+                console.error('Error deleting thumbnail from S3:', s3Error);
+            }
+        }
+
+        // Delete video from DynamoDB
+        await docClient.send(new DeleteCommand({
+            TableName: OTT_TABLE,
+            Key: { videoId }
+        }));
+
+        // Also delete all comments for this video
+        try {
+            const commentsResult = await docClient.send(new QueryCommand({
+                TableName: OTT_COMMENTS_TABLE,
+                KeyConditionExpression: 'videoId = :vid',
+                ExpressionAttributeValues: { ':vid': videoId }
+            }));
+
+            for (const comment of (commentsResult.Items || [])) {
+                await docClient.send(new DeleteCommand({
+                    TableName: OTT_COMMENTS_TABLE,
+                    Key: { videoId: comment.videoId, commentId: comment.commentId }
+                }));
+            }
+        } catch (commentError) {
+            console.error('Error deleting comments:', commentError);
+        }
+
+        res.json({ success: true, message: 'Video deleted successfully' });
+    } catch (error) {
+        console.error('Error deleting video:', error);
+        res.status(500).json({ success: false, message: 'Failed to delete video' });
     }
 });
 
