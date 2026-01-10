@@ -53,11 +53,35 @@ router.get('/videos', async (req, res) => {
         // Apply limit after sorting
         const limitedVideos = videos.slice(0, parseInt(limit));
 
-        // Add isLiked status for current user
-        const videosWithStatus = limitedVideos.map(video => ({
-            ...video,
-            isLiked: video.likedBy?.includes(userId) || false
-        }));
+        // CRITICAL FIX: Populate creatorName and creatorAvatar from Users table
+        const uniqueCreatorIds = [...new Set(limitedVideos.map(v => v.creatorId).filter(Boolean))];
+        const userMap = new Map();
+
+        // Fetch user data for all creators
+        for (const creatorId of uniqueCreatorIds) {
+            try {
+                const userResult = await docClient.send(new GetCommand({
+                    TableName: 'Buddylynk_Users',
+                    Key: { userId: creatorId }
+                }));
+                if (userResult.Item) {
+                    userMap.set(creatorId, userResult.Item);
+                }
+            } catch (err) {
+                console.error(`Failed to fetch user ${creatorId}:`, err.message);
+            }
+        }
+
+        // Add isLiked status and populate creator info
+        const videosWithStatus = limitedVideos.map(video => {
+            const creator = userMap.get(video.creatorId);
+            return {
+                ...video,
+                creatorName: creator?.username || creator?.fullName || video.creatorName || 'Unknown',
+                creatorAvatar: creator?.avatar || video.creatorAvatar,
+                isLiked: video.likedBy?.includes(userId) || false
+            };
+        });
 
         res.json({
             success: true,
@@ -371,13 +395,38 @@ router.get('/trending', async (req, res) => {
             Limit: 50
         }));
 
+        const items = result.Items || [];
+
+        // Populate creatorName and creatorAvatar from Users table
+        const uniqueCreatorIds = [...new Set(items.map(v => v.creatorId).filter(Boolean))];
+        const userMap = new Map();
+
+        for (const creatorId of uniqueCreatorIds) {
+            try {
+                const userResult = await docClient.send(new GetCommand({
+                    TableName: 'Buddylynk_Users',
+                    Key: { userId: creatorId }
+                }));
+                if (userResult.Item) {
+                    userMap.set(creatorId, userResult.Item);
+                }
+            } catch (err) {
+                console.error(`Failed to fetch user ${creatorId}:`, err.message);
+            }
+        }
+
         // Sort by view count + like count (trending score)
-        const videos = (result.Items || [])
-            .map(v => ({
-                ...v,
-                trendingScore: (v.viewCount || 0) + (v.likeCount || 0) * 2,
-                isLiked: v.likedBy?.includes(userId) || false
-            }))
+        const videos = items
+            .map(v => {
+                const creator = userMap.get(v.creatorId);
+                return {
+                    ...v,
+                    creatorName: creator?.username || creator?.fullName || v.creatorName || 'Unknown',
+                    creatorAvatar: creator?.avatar || v.creatorAvatar,
+                    trendingScore: (v.viewCount || 0) + (v.likeCount || 0) * 2,
+                    isLiked: v.likedBy?.includes(userId) || false
+                };
+            })
             .sort((a, b) => b.trendingScore - a.trendingScore)
             .slice(0, parseInt(limit));
 
