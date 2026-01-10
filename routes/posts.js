@@ -51,6 +51,14 @@ function convertPostMediaUrls(post) {
     if (post.isNSFW === undefined) post.isNSFW = false;
     if (post.isSensitive === undefined) post.isSensitive = false;
 
+    // Map backend field names to Android field names
+    // Backend stores: likes, shares, views, comments
+    // Android expects: likesCount, sharesCount, viewsCount, commentsCount
+    post.likesCount = post.likes || post.likesCount || 0;
+    post.sharesCount = post.shares || post.sharesCount || 0;
+    post.viewsCount = post.views || post.viewsCount || 0;
+    post.commentsCount = post.comments || post.commentsCount || 0;
+
     return post;
 }
 
@@ -416,6 +424,25 @@ router.post('/:postId/share', async (req, res) => {
     } catch (err) {
         console.error('Share error:', err);
         res.status(500).json({ error: 'Failed to share post' });
+    }
+});
+
+// View post - increments views count (no auth required)
+router.post('/:postId/view', async (req, res) => {
+    try {
+        const { postId } = req.params;
+
+        await docClient.send(new UpdateCommand({
+            TableName: Tables.POSTS,
+            Key: { postId },
+            UpdateExpression: 'SET views = if_not_exists(views, :zero) + :inc',
+            ExpressionAttributeValues: { ':inc': 1, ':zero': 0 }
+        }));
+
+        res.json({ success: true });
+    } catch (err) {
+        console.error('View error:', err);
+        res.status(500).json({ error: 'Failed to track view' });
     }
 });
 
