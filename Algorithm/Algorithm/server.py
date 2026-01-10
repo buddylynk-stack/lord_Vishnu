@@ -1,238 +1,358 @@
 """
-MindFlow Production Server
-FastAPI-based high-performance recommendation API.
+MindFlow Production Recommendation Server
+FastAPI-based recommendation engine with DynamoDB integration.
+Connects to real user behavior data for personalized recommendations.
 """
 
 import os
 import time
-import asyncio
-from typing import List, Dict, Optional
+import hashlib
+from typing import List, Dict, Optional, Any
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta
+from collections import defaultdict
 
 import numpy as np
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 import uvicorn
-
-try:
-    import onnxruntime as ort
-except ImportError:
-    raise ImportError("Install onnxruntime: pip install onnxruntime")
-
-try:
-    from cachetools import TTLCache, LRUCache
-except ImportError:
-    TTLCache = dict
-    LRUCache = dict
-
+import boto3
+from boto3.dynamodb.conditions import Key
+from botocore.config import Config
 
 # ============================================================================
 # Configuration
 # ============================================================================
 
 class ServerConfig:
-    MODEL_PATH = os.getenv("MINDFLOW_MODEL", "mindflow.onnx")
     HOST = os.getenv("MINDFLOW_HOST", "0.0.0.0")
     PORT = int(os.getenv("MINDFLOW_PORT", "8000"))
-    WORKERS = int(os.getenv("MINDFLOW_WORKERS", "4"))
-    CACHE_SIZE = int(os.getenv("MINDFLOW_CACHE_SIZE", "10000"))
-    CACHE_TTL = int(os.getenv("MINDFLOW_CACHE_TTL", "300"))  # 5 minutes
+    AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
+    CACHE_TTL = int(os.getenv("CACHE_TTL", "300"))  # 5 minutes
+
+# DynamoDB Tables
+TABLES = {
+    'USER_BEHAVIOR': 'Buddylynk_UserBehavior',
+    'POSTS': 'Buddylynk_Posts',
+    'USERS': 'Buddylynk_Users',
+    'OTT_VIDEOS': 'buddylynk-ott-videos',
+    'SAVES': 'Buddylynk_Saves',
+    'FOLLOWS': 'Buddylynk_Follows'
+}
+
+# Action types and weights
+ACTION_WEIGHTS = {
+    0: 1.0,   # VIEW - base engagement
+    1: 3.0,   # LIKE - strong positive
+    2: 5.0,   # SHARE - very strong positive
+    3: 4.0,   # COMMENT - high engagement
+    4: 4.0,   # SAVE - strong intent
+    5: -0.5,  # SKIP - mild negative
+    6: -2.0,  # UNLIKE - negative
+    7: -2.0   # UNSAVE - negative
+}
 
 
 # ============================================================================
 # Request/Response Models
 # ============================================================================
 
-class PredictionRequest(BaseModel):
-    """Single prediction request."""
-    user_id: int = Field(..., description="User ID")
-    content_ids: List[int] = Field(..., min_length=1, max_length=20, description="Recent content IDs")
-    action_types: List[int] = Field(..., min_length=1, max_length=20, description="Action types (0-9)")
-    hours: List[int] = Field(..., min_length=1, max_length=20, description="Hours (0-23)")
-    days: List[int] = Field(..., min_length=1, max_length=20, description="Days (0-6)")
+class RecommendationRequest(BaseModel):
+    user_id: str = Field(..., description="User ID")
+    limit: int = Field(default=20, ge=1, le=100)
+    content_type: str = Field(default="all", description="all, posts, or videos")
 
 
-class PredictionResponse(BaseModel):
-    """Prediction response."""
-    user_id: int
-    engagement: float = Field(..., description="Engagement score (0-1)")
-    click_prob: float = Field(..., description="Click probability (0-1)")
-    watch_time: float = Field(..., description="Predicted watch time (seconds)")
-    latency_ms: float = Field(..., description="Inference latency")
-    cached: bool = Field(default=False, description="Whether result was cached")
-
-
-class BatchPredictionRequest(BaseModel):
-    """Batch prediction request."""
-    requests: List[PredictionRequest] = Field(..., max_length=100)
-
-
-class BatchPredictionResponse(BaseModel):
-    """Batch prediction response."""
-    predictions: List[PredictionResponse]
-    total_latency_ms: float
+class RecommendationResponse(BaseModel):
+    user_id: str
+    recommendations: List[Dict[str, Any]]
+    algorithm: str
+    latency_ms: float
 
 
 class HealthResponse(BaseModel):
-    """Health check response."""
     status: str
-    model_loaded: bool
-    cache_size: int
+    db_connected: bool
     uptime_seconds: float
+    total_requests: int
 
 
 # ============================================================================
-# Inference Engine
+# DynamoDB Client
 # ============================================================================
 
-class ProductionInferenceEngine:
-    """High-performance production inference engine."""
+class DynamoDBClient:
+    """DynamoDB client with caching."""
     
-    SEQUENCE_LENGTH = 20
-    
-    def __init__(self, model_path: str, num_threads: int = 4, cache_size: int = 10000, cache_ttl: int = 300):
-        # ONNX Runtime session
-        sess_options = ort.SessionOptions()
-        sess_options.intra_op_num_threads = num_threads
-        sess_options.inter_op_num_threads = num_threads
-        sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        sess_options.execution_mode = ort.ExecutionMode.ORT_PARALLEL
-        
-        self.session = ort.InferenceSession(
-            model_path,
-            sess_options,
-            providers=['CPUExecutionProvider'],
+    def __init__(self, region: str = 'us-east-1'):
+        config = Config(
+            region_name=region,
+            retries={'max_attempts': 3, 'mode': 'standard'}
         )
+        self.dynamodb = boto3.resource('dynamodb', config=config)
+        self.client = boto3.client('dynamodb', config=config)
+        self._cache = {}
+        self._cache_times = {}
+        self.connected = False
         
-        # Prediction cache
-        if TTLCache != dict:
-            self.cache = TTLCache(maxsize=cache_size, ttl=cache_ttl)
-        else:
-            self.cache = {}
+        # Test connection
+        try:
+            self.client.describe_table(TableName=TABLES['POSTS'])
+            self.connected = True
+            print("✅ DynamoDB connected!")
+        except Exception as e:
+            print(f"⚠️ DynamoDB connection failed: {e}")
+    
+    def _cache_key(self, table: str, key: str) -> str:
+        return f"{table}:{key}"
+    
+    def _is_cached(self, cache_key: str) -> bool:
+        if cache_key not in self._cache_times:
+            return False
+        return (time.time() - self._cache_times[cache_key]) < ServerConfig.CACHE_TTL
+    
+    def get_user_behavior(self, user_id: str, days: int = 30, limit: int = 200) -> List[Dict]:
+        """Get user behavior history from DynamoDB."""
+        cache_key = self._cache_key('behavior', f"{user_id}:{days}")
         
-        # Stats
+        if self._is_cached(cache_key):
+            return self._cache[cache_key]
+        
+        try:
+            table = self.dynamodb.Table(TABLES['USER_BEHAVIOR'])
+            start_time = int((datetime.now() - timedelta(days=days)).timestamp() * 1000)
+            
+            response = table.query(
+                KeyConditionExpression=Key('userId').eq(user_id) & Key('timestamp').gte(start_time),
+                Limit=limit,
+                ScanIndexForward=False  # Most recent first
+            )
+            
+            items = response.get('Items', [])
+            self._cache[cache_key] = items
+            self._cache_times[cache_key] = time.time()
+            
+            return items
+        except Exception as e:
+            print(f"Error getting behavior for {user_id}: {e}")
+            return []
+    
+    def get_all_posts(self, limit: int = 500) -> List[Dict]:
+        """Get all posts for scoring."""
+        cache_key = self._cache_key('posts', 'all')
+        
+        if self._is_cached(cache_key):
+            return self._cache[cache_key]
+        
+        try:
+            table = self.dynamodb.Table(TABLES['POSTS'])
+            response = table.scan(Limit=limit)
+            items = response.get('Items', [])
+            
+            self._cache[cache_key] = items
+            self._cache_times[cache_key] = time.time()
+            
+            return items
+        except Exception as e:
+            print(f"Error getting posts: {e}")
+            return []
+    
+    def get_ott_videos(self, limit: int = 200) -> List[Dict]:
+        """Get all OTT videos for scoring."""
+        cache_key = self._cache_key('videos', 'all')
+        
+        if self._is_cached(cache_key):
+            return self._cache[cache_key]
+        
+        try:
+            table = self.dynamodb.Table(TABLES['OTT_VIDEOS'])
+            response = table.scan(Limit=limit)
+            items = response.get('Items', [])
+            
+            self._cache[cache_key] = items
+            self._cache_times[cache_key] = time.time()
+            
+            return items
+        except Exception as e:
+            print(f"Error getting videos: {e}")
+            return []
+    
+    def get_user_follows(self, user_id: str) -> List[str]:
+        """Get users that this user follows."""
+        cache_key = self._cache_key('follows', user_id)
+        
+        if self._is_cached(cache_key):
+            return self._cache[cache_key]
+        
+        try:
+            table = self.dynamodb.Table(TABLES['FOLLOWS'])
+            response = table.query(
+                KeyConditionExpression=Key('followerId').eq(user_id)
+            )
+            
+            following = [item['followingId'] for item in response.get('Items', [])]
+            self._cache[cache_key] = following
+            self._cache_times[cache_key] = time.time()
+            
+            return following
+        except Exception as e:
+            print(f"Error getting follows for {user_id}: {e}")
+            return []
+
+
+# ============================================================================
+# Recommendation Engine
+# ============================================================================
+
+class RecommendationEngine:
+    """Production recommendation engine using real user behavior."""
+    
+    def __init__(self, db: DynamoDBClient):
+        self.db = db
         self.request_count = 0
-        self.cache_hits = 0
         self.total_latency = 0.0
+    
+    def compute_user_preferences(self, behavior: List[Dict]) -> Dict[str, float]:
+        """Compute user preferences from behavior history."""
+        content_scores = defaultdict(float)
+        creator_scores = defaultdict(float)
+        hour_activity = defaultdict(int)
         
-        # Warmup
-        self._warmup()
-    
-    def _warmup(self, iterations: int = 10):
-        """Warmup model for consistent latency."""
-        dummy = self._create_dummy_input(1)
-        for _ in range(iterations):
-            self.session.run(None, dummy)
-    
-    def _create_dummy_input(self, batch_size: int) -> Dict[str, np.ndarray]:
+        for item in behavior:
+            content_id = item.get('contentId', '')
+            action = int(item.get('actionType', 0))
+            weight = ACTION_WEIGHTS.get(action, 0)
+            creator_id = item.get('contentOwnerId', '')
+            hour = int(item.get('hour', 12))
+            watch_time = float(item.get('watchTime', 0))
+            
+            # Score content
+            content_scores[content_id] += weight
+            
+            # Score creators
+            if creator_id:
+                creator_scores[creator_id] += weight * 0.5
+            
+            # Track active hours
+            hour_activity[hour] += 1
+            
+            # Bonus for watch time (normalized)
+            if watch_time > 0:
+                content_scores[content_id] += min(watch_time / 60, 1) * 2
+        
         return {
-            'user_ids': np.ones(batch_size, dtype=np.int64),
-            'content_ids': np.ones((batch_size, self.SEQUENCE_LENGTH), dtype=np.int64),
-            'action_types': np.zeros((batch_size, self.SEQUENCE_LENGTH), dtype=np.int64),
-            'hours': np.zeros((batch_size, self.SEQUENCE_LENGTH), dtype=np.int64),
-            'days': np.zeros((batch_size, self.SEQUENCE_LENGTH), dtype=np.int64),
+            'content': dict(content_scores),
+            'creators': dict(creator_scores),
+            'active_hours': dict(hour_activity),
+            'total_interactions': len(behavior)
         }
     
-    def _pad_sequence(self, seq: List[int], default: int = 0) -> np.ndarray:
-        arr = np.full(self.SEQUENCE_LENGTH, default, dtype=np.int64)
-        seq = seq[-self.SEQUENCE_LENGTH:]
-        arr[-len(seq):] = seq
-        return arr
+    def score_content(self, content: Dict, preferences: Dict, following: List[str]) -> float:
+        """Score a piece of content for a user."""
+        score = 0.0
+        
+        content_id = content.get('postId') or content.get('videoId') or ''
+        creator_id = content.get('userId') or content.get('creatorId') or ''
+        
+        # Base engagement score
+        likes = int(content.get('likes', 0) or content.get('likeCount', 0) or 0)
+        views = int(content.get('viewCount', 0) or content.get('views', 0) or 1)
+        comments = int(content.get('commentsCount', 0) or content.get('commentCount', 0) or 0)
+        shares = int(content.get('shares', 0) or 0)
+        
+        engagement_rate = (likes * 2 + comments * 3 + shares * 4) / max(views, 1)
+        score += min(engagement_rate * 10, 30)  # Max 30 points for engagement
+        
+        # Boost if from followed user
+        if creator_id in following:
+            score += 25
+        
+        # Boost based on creator affinity
+        creator_affinity = preferences.get('creators', {}).get(creator_id, 0)
+        score += min(creator_affinity * 5, 20)  # Max 20 points
+        
+        # Recency boost (newer content gets more points)
+        created_at = content.get('createdAt', '')
+        if created_at:
+            try:
+                created_dt = datetime.fromisoformat(created_at.replace('Z', '+00:00'))
+                hours_old = (datetime.now(created_dt.tzinfo) - created_dt).total_seconds() / 3600
+                recency_score = max(0, 20 - hours_old / 2)  # Lose 0.5 points per hour
+                score += recency_score
+            except:
+                pass
+        
+        # Current hour matching
+        current_hour = datetime.now().hour
+        if preferences.get('active_hours', {}).get(str(current_hour), 0) > 0:
+            score += 5
+        
+        # Variety - penalize already seen content
+        if content_id in preferences.get('content', {}):
+            score -= 10
+        
+        # Random factor for discovery (5%)
+        score += np.random.random() * 5
+        
+        return score
     
-    def _make_cache_key(self, user_id: int, content_ids: tuple) -> str:
-        return f"{user_id}:{hash(content_ids)}"
-    
-    def predict(self, request: PredictionRequest) -> Dict:
-        """Single prediction with caching."""
+    def get_recommendations(self, user_id: str, limit: int = 20, content_type: str = "all") -> List[Dict]:
+        """Get personalized recommendations for a user."""
         start = time.perf_counter()
         self.request_count += 1
         
-        # Check cache
-        cache_key = self._make_cache_key(request.user_id, tuple(request.content_ids))
-        if cache_key in self.cache:
-            self.cache_hits += 1
-            result = self.cache[cache_key].copy()
-            result['cached'] = True
-            result['latency_ms'] = (time.perf_counter() - start) * 1000
-            return result
+        # Get user data
+        behavior = self.db.get_user_behavior(user_id)
+        following = self.db.get_user_follows(user_id)
+        preferences = self.compute_user_preferences(behavior)
         
-        # Prepare inputs
-        inputs = {
-            'user_ids': np.array([request.user_id], dtype=np.int64),
-            'content_ids': self._pad_sequence(request.content_ids).reshape(1, -1),
-            'action_types': self._pad_sequence(request.action_types).reshape(1, -1),
-            'hours': self._pad_sequence(request.hours).reshape(1, -1),
-            'days': self._pad_sequence(request.days).reshape(1, -1),
-        }
+        # Get content
+        all_content = []
         
-        # Run inference
-        outputs = self.session.run(None, inputs)
+        if content_type in ["all", "posts"]:
+            posts = self.db.get_all_posts()
+            for p in posts:
+                p['_type'] = 'post'
+                p['contentId'] = p.get('postId', '')
+            all_content.extend(posts)
+        
+        if content_type in ["all", "videos"]:
+            videos = self.db.get_ott_videos()
+            for v in videos:
+                v['_type'] = 'video'
+                v['contentId'] = v.get('videoId', '')
+            all_content.extend(videos)
+        
+        # Filter out user's own content
+        all_content = [c for c in all_content if c.get('userId') != user_id and c.get('creatorId') != user_id]
+        
+        # Score and rank
+        scored = []
+        for content in all_content:
+            score = self.score_content(content, preferences, following)
+            scored.append({
+                'contentId': content.get('contentId', ''),
+                'type': content.get('_type', 'unknown'),
+                'score': round(score, 2),
+                'creatorId': content.get('userId') or content.get('creatorId'),
+            })
+        
+        # Sort by score and take top N
+        scored.sort(key=lambda x: x['score'], reverse=True)
+        recommendations = scored[:limit]
         
         latency = (time.perf_counter() - start) * 1000
         self.total_latency += latency
         
-        result = {
-            'user_id': request.user_id,
-            'engagement': float(outputs[0][0]),
-            'click_prob': float(outputs[1][0]),
-            'watch_time': float(outputs[2][0]),
-            'latency_ms': latency,
-            'cached': False,
-        }
-        
-        # Cache result
-        self.cache[cache_key] = result.copy()
-        
-        return result
-    
-    def predict_batch(self, requests: List[PredictionRequest]) -> List[Dict]:
-        """Batch prediction for multiple requests."""
-        start = time.perf_counter()
-        batch_size = len(requests)
-        
-        # Prepare batch inputs
-        user_ids = np.array([r.user_id for r in requests], dtype=np.int64)
-        content_ids = np.array([self._pad_sequence(r.content_ids) for r in requests], dtype=np.int64)
-        action_types = np.array([self._pad_sequence(r.action_types) for r in requests], dtype=np.int64)
-        hours = np.array([self._pad_sequence(r.hours) for r in requests], dtype=np.int64)
-        days = np.array([self._pad_sequence(r.days) for r in requests], dtype=np.int64)
-        
-        inputs = {
-            'user_ids': user_ids,
-            'content_ids': content_ids,
-            'action_types': action_types,
-            'hours': hours,
-            'days': days,
-        }
-        
-        # Run batch inference
-        outputs = self.session.run(None, inputs)
-        
-        latency = (time.perf_counter() - start) * 1000
-        per_item_latency = latency / batch_size
-        
-        results = []
-        for i, request in enumerate(requests):
-            results.append({
-                'user_id': request.user_id,
-                'engagement': float(outputs[0][i]),
-                'click_prob': float(outputs[1][i]),
-                'watch_time': float(outputs[2][i]),
-                'latency_ms': per_item_latency,
-                'cached': False,
-            })
-        
-        return results
+        return recommendations
     
     @property
     def stats(self) -> Dict:
         return {
-            'request_count': self.request_count,
-            'cache_hits': self.cache_hits,
-            'cache_hit_rate': self.cache_hits / max(1, self.request_count),
+            'total_requests': self.request_count,
             'avg_latency_ms': self.total_latency / max(1, self.request_count),
-            'cache_size': len(self.cache),
+            'db_connected': self.db.connected
         }
 
 
@@ -240,41 +360,43 @@ class ProductionInferenceEngine:
 # FastAPI Application
 # ============================================================================
 
-# Global engine
-engine: Optional[ProductionInferenceEngine] = None
+db: Optional[DynamoDBClient] = None
+engine: Optional[RecommendationEngine] = None
 start_time: float = 0
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan handler."""
-    global engine, start_time
+    global db, engine, start_time
     
-    # Startup
-    print(f"🚀 Loading model: {ServerConfig.MODEL_PATH}")
-    engine = ProductionInferenceEngine(
-        model_path=ServerConfig.MODEL_PATH,
-        num_threads=ServerConfig.WORKERS,
-        cache_size=ServerConfig.CACHE_SIZE,
-        cache_ttl=ServerConfig.CACHE_TTL,
-    )
+    print("=" * 60)
+    print("🧠 MindFlow Production Recommendation Server")
+    print("=" * 60)
+    
+    # Initialize DynamoDB
+    print(f"🔗 Connecting to DynamoDB ({ServerConfig.AWS_REGION})...")
+    db = DynamoDBClient(ServerConfig.AWS_REGION)
+    engine = RecommendationEngine(db)
     start_time = time.time()
-    print(f"✅ Model loaded! Server ready.")
+    
+    print(f"✅ Server ready!")
+    print(f"🌐 http://{ServerConfig.HOST}:{ServerConfig.PORT}")
+    print("-" * 60)
     
     yield
     
-    # Shutdown
     print("👋 Shutting down...")
 
 
 app = FastAPI(
     title="MindFlow Recommendation API",
-    description="Production-ready social media recommendation engine",
-    version="1.0.0",
+    description="Production recommendation engine with DynamoDB integration",
+    version="2.0.0",
     lifespan=lifespan,
 )
 
-# CORS middleware
+# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -289,9 +411,9 @@ async def health_check():
     """Health check endpoint."""
     return HealthResponse(
         status="healthy",
-        model_loaded=engine is not None,
-        cache_size=len(engine.cache) if engine else 0,
+        db_connected=db.connected if db else False,
         uptime_seconds=time.time() - start_time,
+        total_requests=engine.request_count if engine else 0
     )
 
 
@@ -299,105 +421,59 @@ async def health_check():
 async def get_stats():
     """Get server statistics."""
     if engine is None:
-        raise HTTPException(status_code=503, detail="Model not loaded")
+        raise HTTPException(status_code=503, detail="Engine not initialized")
     return engine.stats
 
 
-@app.post("/predict", response_model=PredictionResponse)
-async def predict(request: PredictionRequest):
-    """Single prediction endpoint."""
+@app.get("/api/recommendations/{user_id}")
+async def get_recommendations_get(user_id: str, limit: int = 20):
+    """Get recommendations for a user (GET method for compatibility)."""
     if engine is None:
-        raise HTTPException(status_code=503, detail="Model not loaded")
-    
-    result = engine.predict(request)
-    return PredictionResponse(**result)
-
-
-@app.post("/predict/batch", response_model=BatchPredictionResponse)
-async def predict_batch(request: BatchPredictionRequest):
-    """Batch prediction endpoint for high throughput."""
-    if engine is None:
-        raise HTTPException(status_code=503, detail="Model not loaded")
+        raise HTTPException(status_code=503, detail="Engine not initialized")
     
     start = time.perf_counter()
-    results = engine.predict_batch(request.requests)
-    total_latency = (time.perf_counter() - start) * 1000
+    recommendations = engine.get_recommendations(user_id, limit)
+    latency = (time.perf_counter() - start) * 1000
     
-    return BatchPredictionResponse(
-        predictions=[PredictionResponse(**r) for r in results],
-        total_latency_ms=total_latency,
-    )
-
-
-@app.post("/recommend")
-async def get_recommendations(
-    user_id: int,
-    content_history: List[int],
-    action_history: List[int],
-    candidate_ids: List[int],
-    top_k: int = 10,
-):
-    """Get top-K recommendations from candidate content."""
-    if engine is None:
-        raise HTTPException(status_code=503, detail="Model not loaded")
-    
-    # Score each candidate
-    hour = time.localtime().tm_hour
-    day = time.localtime().tm_wday
-    
-    scores = []
-    for content_id in candidate_ids:
-        request = PredictionRequest(
-            user_id=user_id,
-            content_ids=content_history[-19:] + [content_id],
-            action_types=action_history[-19:] + [0],
-            hours=[hour] * 20,
-            days=[day] * 20,
-        )
-        result = engine.predict(request)
-        scores.append({
-            'content_id': content_id,
-            'score': result['engagement'] * 0.4 + result['click_prob'] * 0.4 + min(result['watch_time'] / 60, 1) * 0.2,
-        })
-    
-    # Sort and return top-K
-    scores.sort(key=lambda x: x['score'], reverse=True)
     return {
-        'recommendations': scores[:top_k],
-        'user_id': user_id,
+        "user_id": user_id,
+        "recommendations": recommendations,
+        "algorithm": "mindflow-v2-dynamodb",
+        "latency_ms": round(latency, 2)
     }
+
+
+@app.post("/api/recommendations", response_model=RecommendationResponse)
+async def get_recommendations_post(request: RecommendationRequest):
+    """Get recommendations for a user (POST method)."""
+    if engine is None:
+        raise HTTPException(status_code=503, detail="Engine not initialized")
+    
+    start = time.perf_counter()
+    recommendations = engine.get_recommendations(
+        request.user_id, 
+        request.limit,
+        request.content_type
+    )
+    latency = (time.perf_counter() - start) * 1000
+    
+    return RecommendationResponse(
+        user_id=request.user_id,
+        recommendations=recommendations,
+        algorithm="mindflow-v2-dynamodb",
+        latency_ms=round(latency, 2)
+    )
 
 
 # ============================================================================
 # Entry Point
 # ============================================================================
 
-def main():
-    """Run production server."""
-    print("=" * 60)
-    print("🧠 MindFlow Production Server")
-    print("=" * 60)
-    
-    if not os.path.exists(ServerConfig.MODEL_PATH):
-        print(f"❌ Model not found: {ServerConfig.MODEL_PATH}")
-        print("\n📖 First train and export a model:")
-        print("   python train.py --epochs 50")
-        print("   python export_onnx.py --checkpoint models/best_model.pt")
-        return
-    
-    print(f"📦 Model: {ServerConfig.MODEL_PATH}")
-    print(f"🌐 Host: {ServerConfig.HOST}:{ServerConfig.PORT}")
-    print(f"⚡ Workers: {ServerConfig.WORKERS}")
-    print("-" * 60)
-    
+if __name__ == "__main__":
     uvicorn.run(
-        "server:app",
+        "server_production:app",
         host=ServerConfig.HOST,
         port=ServerConfig.PORT,
-        workers=1,  # Use 1 worker since ONNX is already parallel
+        workers=1,
         reload=False,
     )
-
-
-if __name__ == "__main__":
-    main()

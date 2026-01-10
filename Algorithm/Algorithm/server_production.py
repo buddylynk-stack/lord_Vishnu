@@ -1,25 +1,399 @@
-#!/usr/bin/env python3
 """
-MindFlow Recommendation Server with DynamoDB Integration
-Reads user behavior from DynamoDB and provides personalized recommendations
+MindFlow Production Recommendation Server
+FastAPI-based recommendation engine with DynamoDB integration.
+Connects to real user behavior data for personalized recommendations.
 """
 
 import os
-import json
-import random
-from typing import List, Dict, Optional
+import time
+import hashlib
+from typing import List, Dict, Optional, Any
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
-import boto3
-from boto3.dynamodb.conditions import Key
+from collections import defaultdict
+
+import numpy as np
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 import uvicorn
+import boto3
+from boto3.dynamodb.conditions import Key
+from botocore.config import Config
+
+# ============================================================================
+# Configuration
+# ============================================================================
+
+class ServerConfig:
+    HOST = os.getenv("MINDFLOW_HOST", "0.0.0.0")
+    PORT = int(os.getenv("MINDFLOW_PORT", "8000"))
+    AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
+    CACHE_TTL = int(os.getenv("CACHE_TTL", "300"))  # 5 minutes
+
+# DynamoDB Tables
+TABLES = {
+    'USER_BEHAVIOR': 'Buddylynk_UserBehavior',
+    'POSTS': 'Buddylynk_Posts',
+    'USERS': 'Buddylynk_Users',
+    'OTT_VIDEOS': 'buddylynk-ott-videos',
+    'SAVES': 'Buddylynk_Saves',
+    'FOLLOWS': 'Buddylynk_Follows'
+}
+
+# Action types and weights
+ACTION_WEIGHTS = {
+    0: 1.0,   # VIEW - base engagement
+    1: 3.0,   # LIKE - strong positive
+    2: 5.0,   # SHARE - very strong positive
+    3: 4.0,   # COMMENT - high engagement
+    4: 4.0,   # SAVE - strong intent
+    5: -0.5,  # SKIP - mild negative
+    6: -2.0,  # UNLIKE - negative
+    7: -2.0   # UNSAVE - negative
+}
+
+
+# ============================================================================
+# Request/Response Models
+# ============================================================================
+
+class RecommendationRequest(BaseModel):
+    user_id: str = Field(..., description="User ID")
+    limit: int = Field(default=20, ge=1, le=100)
+    content_type: str = Field(default="all", description="all, posts, or videos")
+
+
+class RecommendationResponse(BaseModel):
+    user_id: str
+    recommendations: List[Dict[str, Any]]
+    algorithm: str
+    latency_ms: float
+
+
+class HealthResponse(BaseModel):
+    status: str
+    db_connected: bool
+    uptime_seconds: float
+    total_requests: int
+
+
+# ============================================================================
+# DynamoDB Client
+# ============================================================================
+
+class DynamoDBClient:
+    """DynamoDB client with caching."""
+    
+    def __init__(self, region: str = 'us-east-1'):
+        config = Config(
+            region_name=region,
+            retries={'max_attempts': 3, 'mode': 'standard'}
+        )
+        self.dynamodb = boto3.resource('dynamodb', config=config)
+        self.client = boto3.client('dynamodb', config=config)
+        self._cache = {}
+        self._cache_times = {}
+        self.connected = False
+        
+        # Test connection
+        try:
+            self.client.describe_table(TableName=TABLES['POSTS'])
+            self.connected = True
+            print("✅ DynamoDB connected!")
+        except Exception as e:
+            print(f"⚠️ DynamoDB connection failed: {e}")
+    
+    def _cache_key(self, table: str, key: str) -> str:
+        return f"{table}:{key}"
+    
+    def _is_cached(self, cache_key: str) -> bool:
+        if cache_key not in self._cache_times:
+            return False
+        return (time.time() - self._cache_times[cache_key]) < ServerConfig.CACHE_TTL
+    
+    def get_user_behavior(self, user_id: str, days: int = 30, limit: int = 200) -> List[Dict]:
+        """Get user behavior history from DynamoDB."""
+        cache_key = self._cache_key('behavior', f"{user_id}:{days}")
+        
+        if self._is_cached(cache_key):
+            return self._cache[cache_key]
+        
+        try:
+            table = self.dynamodb.Table(TABLES['USER_BEHAVIOR'])
+            start_time = int((datetime.now() - timedelta(days=days)).timestamp() * 1000)
+            
+            response = table.query(
+                KeyConditionExpression=Key('userId').eq(user_id) & Key('timestamp').gte(start_time),
+                Limit=limit,
+                ScanIndexForward=False  # Most recent first
+            )
+            
+            items = response.get('Items', [])
+            self._cache[cache_key] = items
+            self._cache_times[cache_key] = time.time()
+            
+            return items
+        except Exception as e:
+            print(f"Error getting behavior for {user_id}: {e}")
+            return []
+    
+    def get_all_posts(self, limit: int = 500) -> List[Dict]:
+        """Get all posts for scoring."""
+        cache_key = self._cache_key('posts', 'all')
+        
+        if self._is_cached(cache_key):
+            return self._cache[cache_key]
+        
+        try:
+            table = self.dynamodb.Table(TABLES['POSTS'])
+            response = table.scan(Limit=limit)
+            items = response.get('Items', [])
+            
+            self._cache[cache_key] = items
+            self._cache_times[cache_key] = time.time()
+            
+            return items
+        except Exception as e:
+            print(f"Error getting posts: {e}")
+            return []
+    
+    def get_ott_videos(self, limit: int = 200) -> List[Dict]:
+        """Get all OTT videos for scoring."""
+        cache_key = self._cache_key('videos', 'all')
+        
+        if self._is_cached(cache_key):
+            return self._cache[cache_key]
+        
+        try:
+            table = self.dynamodb.Table(TABLES['OTT_VIDEOS'])
+            response = table.scan(Limit=limit)
+            items = response.get('Items', [])
+            
+            self._cache[cache_key] = items
+            self._cache_times[cache_key] = time.time()
+            
+            return items
+        except Exception as e:
+            print(f"Error getting videos: {e}")
+            return []
+    
+    def get_user_follows(self, user_id: str) -> List[str]:
+        """Get users that this user follows."""
+        cache_key = self._cache_key('follows', user_id)
+        
+        if self._is_cached(cache_key):
+            return self._cache[cache_key]
+        
+        try:
+            table = self.dynamodb.Table(TABLES['FOLLOWS'])
+            response = table.query(
+                KeyConditionExpression=Key('followerId').eq(user_id)
+            )
+            
+            following = [item['followingId'] for item in response.get('Items', [])]
+            self._cache[cache_key] = following
+            self._cache_times[cache_key] = time.time()
+            
+            return following
+        except Exception as e:
+            print(f"Error getting follows for {user_id}: {e}")
+            return []
+
+
+# ============================================================================
+# Recommendation Engine
+# ============================================================================
+
+class RecommendationEngine:
+    """Production recommendation engine using real user behavior."""
+    
+    def __init__(self, db: DynamoDBClient):
+        self.db = db
+        self.request_count = 0
+        self.total_latency = 0.0
+    
+    def compute_user_preferences(self, behavior: List[Dict]) -> Dict[str, float]:
+        """Compute user preferences from behavior history."""
+        content_scores = defaultdict(float)
+        creator_scores = defaultdict(float)
+        hour_activity = defaultdict(int)
+        
+        for item in behavior:
+            content_id = item.get('contentId', '')
+            action = int(item.get('actionType', 0))
+            weight = ACTION_WEIGHTS.get(action, 0)
+            creator_id = item.get('contentOwnerId', '')
+            hour = int(item.get('hour', 12))
+            watch_time = float(item.get('watchTime', 0))
+            
+            # Score content
+            content_scores[content_id] += weight
+            
+            # Score creators
+            if creator_id:
+                creator_scores[creator_id] += weight * 0.5
+            
+            # Track active hours
+            hour_activity[hour] += 1
+            
+            # Bonus for watch time (normalized)
+            if watch_time > 0:
+                content_scores[content_id] += min(watch_time / 60, 1) * 2
+        
+        return {
+            'content': dict(content_scores),
+            'creators': dict(creator_scores),
+            'active_hours': dict(hour_activity),
+            'total_interactions': len(behavior)
+        }
+    
+    def score_content(self, content: Dict, preferences: Dict, following: List[str]) -> float:
+        """Score a piece of content for a user."""
+        score = 0.0
+        
+        content_id = content.get('postId') or content.get('videoId') or ''
+        creator_id = content.get('userId') or content.get('creatorId') or ''
+        
+        # Base engagement score
+        likes = int(content.get('likes', 0) or content.get('likeCount', 0) or 0)
+        views = int(content.get('viewCount', 0) or content.get('views', 0) or 1)
+        comments = int(content.get('commentsCount', 0) or content.get('commentCount', 0) or 0)
+        shares = int(content.get('shares', 0) or 0)
+        
+        engagement_rate = (likes * 2 + comments * 3 + shares * 4) / max(views, 1)
+        score += min(engagement_rate * 10, 30)  # Max 30 points for engagement
+        
+        # Boost if from followed user
+        if creator_id in following:
+            score += 25
+        
+        # Boost based on creator affinity
+        creator_affinity = preferences.get('creators', {}).get(creator_id, 0)
+        score += min(creator_affinity * 5, 20)  # Max 20 points
+        
+        # Recency boost (newer content gets more points)
+        created_at = content.get('createdAt', '')
+        if created_at:
+            try:
+                created_dt = datetime.fromisoformat(created_at.replace('Z', '+00:00'))
+                hours_old = (datetime.now(created_dt.tzinfo) - created_dt).total_seconds() / 3600
+                recency_score = max(0, 20 - hours_old / 2)  # Lose 0.5 points per hour
+                score += recency_score
+            except:
+                pass
+        
+        # Current hour matching
+        current_hour = datetime.now().hour
+        if preferences.get('active_hours', {}).get(str(current_hour), 0) > 0:
+            score += 5
+        
+        # Variety - penalize already seen content
+        if content_id in preferences.get('content', {}):
+            score -= 10
+        
+        # Random factor for discovery (5%)
+        score += np.random.random() * 5
+        
+        return score
+    
+    def get_recommendations(self, user_id: str, limit: int = 20, content_type: str = "all") -> List[Dict]:
+        """Get personalized recommendations for a user."""
+        start = time.perf_counter()
+        self.request_count += 1
+        
+        # Get user data
+        behavior = self.db.get_user_behavior(user_id)
+        following = self.db.get_user_follows(user_id)
+        preferences = self.compute_user_preferences(behavior)
+        
+        # Get content
+        all_content = []
+        
+        if content_type in ["all", "posts"]:
+            posts = self.db.get_all_posts()
+            for p in posts:
+                p['_type'] = 'post'
+                p['contentId'] = p.get('postId', '')
+            all_content.extend(posts)
+        
+        if content_type in ["all", "videos"]:
+            videos = self.db.get_ott_videos()
+            for v in videos:
+                v['_type'] = 'video'
+                v['contentId'] = v.get('videoId', '')
+            all_content.extend(videos)
+        
+        # Filter out user's own content
+        all_content = [c for c in all_content if c.get('userId') != user_id and c.get('creatorId') != user_id]
+        
+        # Score and rank
+        scored = []
+        for content in all_content:
+            score = self.score_content(content, preferences, following)
+            scored.append({
+                'contentId': content.get('contentId', ''),
+                'type': content.get('_type', 'unknown'),
+                'score': round(score, 2),
+                'creatorId': content.get('userId') or content.get('creatorId'),
+            })
+        
+        # Sort by score and take top N
+        scored.sort(key=lambda x: x['score'], reverse=True)
+        recommendations = scored[:limit]
+        
+        latency = (time.perf_counter() - start) * 1000
+        self.total_latency += latency
+        
+        return recommendations
+    
+    @property
+    def stats(self) -> Dict:
+        return {
+            'total_requests': self.request_count,
+            'avg_latency_ms': self.total_latency / max(1, self.request_count),
+            'db_connected': self.db.connected
+        }
+
+
+# ============================================================================
+# FastAPI Application
+# ============================================================================
+
+db: Optional[DynamoDBClient] = None
+engine: Optional[RecommendationEngine] = None
+start_time: float = 0
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Application lifespan handler."""
+    global db, engine, start_time
+    
+    print("=" * 60)
+    print("🧠 MindFlow Production Recommendation Server")
+    print("=" * 60)
+    
+    # Initialize DynamoDB
+    print(f"🔗 Connecting to DynamoDB ({ServerConfig.AWS_REGION})...")
+    db = DynamoDBClient(ServerConfig.AWS_REGION)
+    engine = RecommendationEngine(db)
+    start_time = time.time()
+    
+    print(f"✅ Server ready!")
+    print(f"🌐 http://{ServerConfig.HOST}:{ServerConfig.PORT}")
+    print("-" * 60)
+    
+    yield
+    
+    print("👋 Shutting down...")
+
 
 app = FastAPI(
     title="MindFlow Recommendation API",
-    description="AI-powered content recommendations for Buddylynk",
-    version="1.0.0"
+    description="Production recommendation engine with DynamoDB integration",
+    version="2.0.0",
+    lifespan=lifespan,
 )
 
 # CORS
@@ -31,317 +405,75 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# DynamoDB
-dynamodb = boto3.resource('dynamodb', region_name='us-east-1')
-behavior_table = dynamodb.Table('Buddylynk_UserBehavior')
-embeddings_table = dynamodb.Table('Buddylynk_UserEmbeddings')
-content_table = dynamodb.Table('Buddylynk_ContentFeatures')
 
-# Action weights for scoring
-ACTION_WEIGHTS = {
-    0: 1.0,   # VIEW
-    1: 3.0,   # LIKE - strong positive
-    2: 5.0,   # SHARE - very strong positive
-    3: 4.0,   # COMMENT - high engagement
-    4: 4.0,   # SAVE - strong intent
-    5: -0.5,  # SKIP - mild negative
-    6: -2.0,  # UNLIKE - negative
-    7: -2.0   # UNSAVE - negative
-}
-
-
-class UserRequest(BaseModel):
-    userId: str
-    limit: int = 20
-    excludeIds: List[str] = []
-
-
-class ContentScoreRequest(BaseModel):
-    userId: str
-    contentIds: List[str]
-
-
-class RecommendationResponse(BaseModel):
-    userId: str
-    recommendations: List[Dict]
-    algorithm: str = "mindflow-v1"
-    timestamp: str
-
-
-@app.get("/health")
+@app.get("/health", response_model=HealthResponse)
 async def health_check():
-    return {"status": "ok", "service": "mindflow", "version": "1.0.0"}
+    """Health check endpoint."""
+    return HealthResponse(
+        status="healthy",
+        db_connected=db.connected if db else False,
+        uptime_seconds=time.time() - start_time,
+        total_requests=engine.request_count if engine else 0
+    )
+
+
+@app.get("/stats")
+async def get_stats():
+    """Get server statistics."""
+    if engine is None:
+        raise HTTPException(status_code=503, detail="Engine not initialized")
+    return engine.stats
 
 
 @app.get("/api/recommendations/{user_id}")
-async def get_recommendations(user_id: str, limit: int = 20, exclude_own: bool = True, include_nsfw: bool = False):
-    """
-    Get personalized content recommendations for a user.
-    EXCLUDES the user's own posts - only shows content from OTHER users.
-    Finds similar users based on engagement patterns and recommends their content.
+async def get_recommendations_get(user_id: str, limit: int = 20):
+    """Get recommendations for a user (GET method for compatibility)."""
+    if engine is None:
+        raise HTTPException(status_code=503, detail="Engine not initialized")
     
-    Args:
-        include_nsfw: If True, will include 18+ content in recommendations (user must have enabled this)
-    """
-    try:
-        # 1. Get user behavior history (last 30 days)
-        cutoff = int((datetime.now() - timedelta(days=30)).timestamp() * 1000)
-        
-        response = behavior_table.query(
-            KeyConditionExpression=Key('userId').eq(user_id) & Key('timestamp').gt(cutoff),
-            ScanIndexForward=False,
-            Limit=100
-        )
-        
-        user_history = response.get('Items', [])
-        
-        # 2. Analyze user preferences from behavior
-        content_scores = {}
-        action_counts = {i: 0 for i in range(8)}
-        user_own_content = set()  # Content created by this user (to exclude)
-        already_seen = set()  # Content already viewed (to avoid repeats)
-        
-        for item in user_history:
-            content_id = item.get('contentId')
-            action_type = int(item.get('actionType', 0))
-            weight = ACTION_WEIGHTS.get(action_type, 1.0)
-            content_owner = item.get('contentOwnerId', '')
-            
-            action_counts[action_type] = action_counts.get(action_type, 0) + 1
-            already_seen.add(content_id)
-            
-            # Track user's own content to EXCLUDE
-            if content_owner == user_id:
-                user_own_content.add(content_id)
-            
-            # Build affinity scores for OTHER users' content only
-            if content_owner != user_id and content_id not in user_own_content:
-                if content_id not in content_scores:
-                    content_scores[content_id] = 0
-                content_scores[content_id] += weight
-        
-        # 3. Calculate user engagement profile
-        total_actions = sum(action_counts.values()) or 1
-        engagement_score = sum(
-            action_counts.get(i, 0) * ACTION_WEIGHTS.get(i, 0) 
-            for i in range(8)
-        ) / total_actions
-        
-        # 4. Get liked content patterns (from OTHER users)
-        liked_content = [
-            cid for cid, score in content_scores.items() 
-            if score > 2.0 and cid not in user_own_content
-        ]
-        
-        # 5. Find similar users based on engagement patterns
-        similar_users = set()
-        for cid in liked_content[:10]:  # Top 10 liked content
-            # Find other users who liked the same content
-            try:
-                content_engagers = behavior_table.query(
-                    IndexName='contentId-timestamp-index',
-                    KeyConditionExpression=Key('contentId').eq(cid),
-                    Limit=20
-                )
-                for engager in content_engagers.get('Items', []):
-                    engager_id = engager.get('userId')
-                    if engager_id != user_id:  # Not the current user
-                        similar_users.add(engager_id)
-            except:
-                pass
-        
-        # 6. Get content from similar users (EXCLUDING current user's content)
-        recommended_from_similar = []
-        for similar_user in list(similar_users)[:5]:  # Top 5 similar users
-            try:
-                similar_behavior = behavior_table.query(
-                    KeyConditionExpression=Key('userId').eq(similar_user) & Key('timestamp').gt(cutoff),
-                    Limit=20
-                )
-                for item in similar_behavior.get('Items', []):
-                    cid = item.get('contentId')
-                    owner = item.get('contentOwnerId', '')
-                    action = int(item.get('actionType', 0))
-                    
-                    # EXCLUDE: user's own content, already seen, and low engagement
-                    if (owner != user_id and 
-                        cid not in user_own_content and 
-                        cid not in already_seen and
-                        action in [1, 2, 3, 4]):  # Only positive actions
-                        recommended_from_similar.append({
-                            "contentId": cid,
-                            "score": round(ACTION_WEIGHTS.get(action, 1.0) / 5.0, 3),
-                            "reason": "similar_users_liked",
-                            "similarUser": similar_user[:4] + "..."  # Partial for privacy
-                        })
-            except:
-                pass
-        
-        # 7. Deduplicate and sort recommendations
-        seen_content = set()
-        final_recommendations = []
-        for rec in sorted(recommended_from_similar, key=lambda x: x['score'], reverse=True):
-            cid = rec['contentId']
-            if cid not in seen_content and cid not in user_own_content:
-                seen_content.add(cid)
-                final_recommendations.append(rec)
-                if len(final_recommendations) >= limit:
-                    break
-        
-        return {
-            "userId": user_id,
-            "recommendations": final_recommendations,
-            "filters": {
-                "excludedOwnContent": len(user_own_content),
-                "excludedAlreadySeen": len(already_seen),
-                "similarUsersFound": len(similar_users),
-                "includesNSFW": include_nsfw  # 18+ content included if user enabled
-            },
-            "userProfile": {
-                "engagementScore": round(engagement_score, 2),
-                "totalActions": total_actions,
-                "likedContent": len(liked_content)
-            },
-            "algorithm": "mindflow-v1.1-exclude-own",
-            "timestamp": datetime.now().isoformat()
-        }
-        
-    except Exception as e:
-        print(f"Error getting recommendations: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/api/score")
-async def score_content(request: ContentScoreRequest):
-    """Score specific content for a user"""
-    try:
-        user_id = request.userId
-        content_ids = request.contentIds
-        
-        # Get user behavior
-        cutoff = int((datetime.now() - timedelta(days=30)).timestamp() * 1000)
-        
-        response = behavior_table.query(
-            KeyConditionExpression=Key('userId').eq(user_id) & Key('timestamp').gt(cutoff),
-            Limit=50
-        )
-        
-        user_history = response.get('Items', [])
-        
-        # Calculate content affinity
-        liked_patterns = set()
-        for item in user_history:
-            action_type = int(item.get('actionType', 0))
-            if action_type in [1, 2, 3, 4]:  # LIKE, SHARE, COMMENT, SAVE
-                liked_patterns.add(item.get('contentId', '')[:8])  # Pattern prefix
-        
-        # Score each content
-        scores = {}
-        for cid in content_ids:
-            base_score = 0.5  # Neutral
-            
-            # Boost if matches liked patterns
-            if cid[:8] in liked_patterns:
-                base_score += 0.3
-            
-            # Add some randomness for exploration
-            base_score += random.uniform(-0.1, 0.1)
-            
-            scores[cid] = round(min(1.0, max(0.0, base_score)), 3)
-        
-        return {
-            "userId": user_id,
-            "scores": scores,
-            "algorithm": "mindflow-v1"
-        }
-        
-    except Exception as e:
-        print(f"Error scoring content: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/api/user/{user_id}/profile")
-async def get_user_profile(user_id: str):
-    """Get user's engagement profile and preferences"""
-    try:
-        # Get behavior history
-        cutoff = int((datetime.now() - timedelta(days=30)).timestamp() * 1000)
-        
-        response = behavior_table.query(
-            KeyConditionExpression=Key('userId').eq(user_id) & Key('timestamp').gt(cutoff),
-            Limit=100
-        )
-        
-        items = response.get('Items', [])
-        
-        # Analyze behavior
-        action_counts = {}
-        content_engagement = {}
-        time_patterns = {"hours": {}, "days": {}}
-        
-        for item in items:
-            action = int(item.get('actionType', 0))
-            content_id = item.get('contentId', '')
-            hour = int(item.get('hour', 12))
-            day = int(item.get('dayOfWeek', 0))
-            
-            action_counts[action] = action_counts.get(action, 0) + 1
-            
-            if content_id not in content_engagement:
-                content_engagement[content_id] = 0
-            content_engagement[content_id] += ACTION_WEIGHTS.get(action, 1.0)
-            
-            time_patterns["hours"][hour] = time_patterns["hours"].get(hour, 0) + 1
-            time_patterns["days"][day] = time_patterns["days"].get(day, 0) + 1
-        
-        # Find peak activity times
-        peak_hour = max(time_patterns["hours"].items(), key=lambda x: x[1])[0] if time_patterns["hours"] else 12
-        peak_day = max(time_patterns["days"].items(), key=lambda x: x[1])[0] if time_patterns["days"] else 0
-        
-        # Calculate engagement score
-        total_score = sum(
-            action_counts.get(action, 0) * weight 
-            for action, weight in ACTION_WEIGHTS.items()
-        )
-        
-        return {
-            "userId": user_id,
-            "profile": {
-                "totalActions": sum(action_counts.values()),
-                "engagementScore": round(total_score / max(sum(action_counts.values()), 1), 2),
-                "actionBreakdown": action_counts,
-                "topContent": sorted(
-                    content_engagement.items(), 
-                    key=lambda x: x[1], 
-                    reverse=True
-                )[:5],
-                "peakActivityHour": peak_hour,
-                "peakActivityDay": peak_day
-            },
-            "lastUpdated": datetime.now().isoformat()
-        }
-        
-    except Exception as e:
-        print(f"Error getting user profile: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/api/stats")
-async def get_stats():
-    """Get overall algorithm stats"""
+    start = time.perf_counter()
+    recommendations = engine.get_recommendations(user_id, limit)
+    latency = (time.perf_counter() - start) * 1000
+    
     return {
-        "service": "mindflow",
-        "version": "1.0.0",
-        "tables": {
-            "behavior": "Buddylynk_UserBehavior",
-            "embeddings": "Buddylynk_UserEmbeddings",
-            "content": "Buddylynk_ContentFeatures"
-        },
-        "actionWeights": ACTION_WEIGHTS,
-        "timestamp": datetime.now().isoformat()
+        "user_id": user_id,
+        "recommendations": recommendations,
+        "algorithm": "mindflow-v2-dynamodb",
+        "latency_ms": round(latency, 2)
     }
 
 
+@app.post("/api/recommendations", response_model=RecommendationResponse)
+async def get_recommendations_post(request: RecommendationRequest):
+    """Get recommendations for a user (POST method)."""
+    if engine is None:
+        raise HTTPException(status_code=503, detail="Engine not initialized")
+    
+    start = time.perf_counter()
+    recommendations = engine.get_recommendations(
+        request.user_id, 
+        request.limit,
+        request.content_type
+    )
+    latency = (time.perf_counter() - start) * 1000
+    
+    return RecommendationResponse(
+        user_id=request.user_id,
+        recommendations=recommendations,
+        algorithm="mindflow-v2-dynamodb",
+        latency_ms=round(latency, 2)
+    )
+
+
+# ============================================================================
+# Entry Point
+# ============================================================================
+
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    uvicorn.run(
+        "server_production:app",
+        host=ServerConfig.HOST,
+        port=ServerConfig.PORT,
+        workers=1,
+        reload=False,
+    )
