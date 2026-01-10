@@ -168,6 +168,41 @@ router.get('/feed', async (req, res) => {
             return converted;
         });
 
+        // CRITICAL FIX: Populate username and userAvatar for each post
+        // Get unique userIds from posts
+        const uniqueUserIds = [...new Set(posts.map(p => p.userId))];
+        console.log(`[Feed] Looking up ${uniqueUserIds.length} unique users for posts`);
+
+        // Batch fetch users (simple approach - fetch each user)
+        const userMap = new Map();
+        for (const uid of uniqueUserIds) {
+            try {
+                const userResult = await docClient.send(new GetCommand({
+                    TableName: Tables.USERS,
+                    Key: { userId: uid },
+                    ProjectionExpression: 'userId, username, avatar, fullName'
+                }));
+                if (userResult.Item) {
+                    userMap.set(uid, userResult.Item);
+                }
+            } catch (userErr) {
+                console.error(`[Feed] Failed to fetch user ${uid}:`, userErr.message);
+            }
+        }
+
+        // Populate username and userAvatar for each post
+        posts = posts.map(post => {
+            const user = userMap.get(post.userId);
+            if (user) {
+                post.username = user.username || user.fullName || 'Unknown';
+                post.userAvatar = toCloudFrontUrl(user.avatar);
+            } else {
+                post.username = post.username || 'Unknown';
+            }
+            return post;
+        });
+        console.log(`[Feed] Populated user info for ${posts.length} posts`);
+
         // Build a map for quick lookups
         const postMap = new Map(posts.map(p => [p.postId, p]));
 
