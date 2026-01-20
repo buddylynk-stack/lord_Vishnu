@@ -90,6 +90,17 @@ app.use(cors({
 }));
 app.use(express.json({ limit: '10mb' }));
 
+// GZIP Compression for smaller responses (critical for slow networks)
+const compression = require('compression');
+app.use(compression({
+    level: 6, // Balanced compression level
+    threshold: 1024, // Only compress responses > 1KB
+    filter: (req, res) => {
+        if (req.headers['x-no-compression']) return false;
+        return compression.filter(req, res);
+    }
+}));
+
 // Security middleware - request logging
 const { requestLogger } = require('./middleware/security');
 app.use(requestLogger);
