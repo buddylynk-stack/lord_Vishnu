@@ -24,6 +24,9 @@ const { initializeSignaling } = require('./services/signaling');
 const app = express();
 const server = http.createServer(app);
 
+// Trust first proxy (nginx) - required for express-rate-limit behind reverse proxy
+app.set('trust proxy', 1);
+
 // Serve assetlinks.json for Android App Links verification
 app.use('/.well-known', express.static(path.join(__dirname, '.well-known')));
 
