@@ -27,6 +27,11 @@ const server = http.createServer(app);
 // Serve assetlinks.json for Android App Links verification
 app.use('/.well-known', express.static(path.join(__dirname, '.well-known')));
 
+// Serve ads.txt for AdMob verification
+app.get('/ads.txt', (req, res) => {
+    res.type('text/plain').sendFile(path.join(__dirname, 'ads.txt'));
+});
+
 // Socket.io for WebRTC call signaling - SECURITY: Restrict CORS
 const allowedOrigins = process.env.ALLOWED_ORIGINS ? process.env.ALLOWED_ORIGINS.split(',') : [];
 const io = new Server(server, {
